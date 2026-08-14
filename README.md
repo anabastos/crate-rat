@@ -9,6 +9,12 @@ tidal dl
     - ssh
 
 - add playlist to crates
+  - automatically tries to link playlists by folder name
+  - you can manually link playlist to existing folder on crate
+
+- check playlist
+  - checks which songs are missing
+  - which songs dont exist on tidal
 
 - sync
     - songs on a playlists will be sync between all AVAILABLE(sometimes its an external hd or pendrive) crates
