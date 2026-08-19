@@ -4,6 +4,7 @@ mod metadata;
 mod model;
 mod soundcloud;
 mod spotify;
+mod tidal;
 mod sync;
 mod ui;
 
@@ -35,6 +36,7 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), B
     while !app.should_quit {
         app.poll_spotify_login();
         app.poll_spotify_import();
+        app.poll_tidal_search();
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {

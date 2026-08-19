@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::KeyCode;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
@@ -10,6 +12,7 @@ use crate::soundcloud;
 use crate::spotify;
 use crate::sync;
 use crate::sync::TrackFile;
+use crate::tidal;
 
 pub struct App {
     pub should_quit: bool,
@@ -32,6 +35,9 @@ pub struct App {
     picker: Option<Picker>,
     pub spotify_client_id: Option<String>,
     pub spotify_refresh_token: Option<String>,
+    pub tidal_client_id: Option<String>,
+    pub tidal_client_secret: Option<String>,
+    pub settings_field: usize,
     pub editing_settings: bool,
     pub settings_buffer: String,
     pub settings_cursor: usize,
@@ -43,6 +49,7 @@ pub struct App {
     pub audio_paused: bool,
     import_fetch_rx: Option<std::sync::mpsc::Receiver<Result<ImportedPlaylist, String>>>,
     pending_spotify_import: Option<PendingImport>,
+    tidal_search_rx: Option<std::sync::mpsc::Receiver<Result<Vec<bool>, String>>>,
 }
 
 struct PendingImport {
@@ -74,6 +81,8 @@ pub struct TrackView {
     pub selected: usize,
     pub metadata: Option<TrackMetadata>,
     pub cover: Option<Box<dyn Protocol>>,
+    /// One slot per track: `None` = not checked, `Some(true/false)` = found/not found on Tidal.
+    pub tidal_status: Vec<Option<bool>>,
 }
 
 pub struct TagBrowser {
@@ -134,6 +143,9 @@ impl App {
             picker: None,
             spotify_client_id: None,
             spotify_refresh_token: None,
+            tidal_client_id: None,
+            tidal_client_secret: None,
+            settings_field: 0,
             editing_settings: false,
             settings_buffer: String::new(),
             settings_cursor: 0,
@@ -145,6 +157,7 @@ impl App {
             audio_paused: false,
             import_fetch_rx: None,
             pending_spotify_import: None,
+            tidal_search_rx: None,
         }
     }
 
@@ -208,7 +221,13 @@ impl App {
     }
 
     fn save_config(&self) -> std::io::Result<()> {
-        config::save(&config::AppConfig { crates: self.crates.clone(), spotify_client_id: self.spotify_client_id.clone(), spotify_refresh_token: self.spotify_refresh_token.clone() })
+        config::save(&config::AppConfig {
+            crates: self.crates.clone(),
+            spotify_client_id: self.spotify_client_id.clone(),
+            spotify_refresh_token: self.spotify_refresh_token.clone(),
+            tidal_client_id: self.tidal_client_id.clone(),
+            tidal_client_secret: self.tidal_client_secret.clone(),
+        })
     }
 
     fn ensure_picker(&mut self) -> &mut Picker {
@@ -257,12 +276,16 @@ impl App {
             Ok(Some(loaded)) if !loaded.crates.is_empty() => {
                 app.spotify_client_id = loaded.spotify_client_id;
                 app.spotify_refresh_token = loaded.spotify_refresh_token;
+                app.tidal_client_id = loaded.tidal_client_id;
+                app.tidal_client_secret = loaded.tidal_client_secret;
                 app.crates = loaded.crates;
                 app.message = "Welcome back. Your crate map is loaded.".into();
             }
             Ok(Some(loaded)) => {
                 app.spotify_client_id = loaded.spotify_client_id;
                 app.spotify_refresh_token = loaded.spotify_refresh_token;
+                app.tidal_client_id = loaded.tidal_client_id;
+                app.tidal_client_secret = loaded.tidal_client_secret;
                 app.message = "No crates yet. Press c, then n to add one.".into();
             }
             Ok(None) => app.message = format!("No config yet. Press c, then n to add a crate. ({})", config::display_path()),
@@ -378,7 +401,8 @@ impl App {
                     return;
                 };
                 let tracks = sync::list_playlist_tracks(crate_location, &playlist.name);
-                self.tracks = Some(TrackView { crate_name: crate_location.name.clone(), playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None });
+                let tidal_status = vec![None; tracks.len()];
+                self.tracks = Some(TrackView { crate_name: crate_location.name.clone(), playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None, tidal_status });
                 self.refresh_selected_track();
             }
             KeyCode::Char('T') => {
@@ -426,12 +450,26 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let value = self.settings_buffer.trim().to_string();
-                    self.spotify_client_id = if value.is_empty() { None } else { Some(value) };
+                    let value = if value.is_empty() { None } else { Some(value) };
+                    let label = match self.settings_field {
+                        0 => {
+                            self.spotify_client_id = value;
+                            "Spotify Client ID"
+                        }
+                        1 => {
+                            self.tidal_client_id = value;
+                            "Tidal Client ID"
+                        }
+                        _ => {
+                            self.tidal_client_secret = value;
+                            "Tidal Client Secret"
+                        }
+                    };
                     self.editing_settings = false;
                     self.settings_buffer.clear();
                     self.settings_cursor = 0;
                     self.message = match self.save_config() {
-                        Ok(()) => "Spotify Client ID saved.".into(),
+                        Ok(()) => format!("{label} saved."),
                         Err(error) => format!("Saved for this session, but could not write config: {error}"),
                     };
                 }
@@ -467,8 +505,10 @@ impl App {
             KeyCode::Esc | KeyCode::Char('s') => {
                 self.screen = Screen::Dashboard;
             }
-            KeyCode::Char('e') => {
-                self.settings_buffer = self.spotify_client_id.clone().unwrap_or_default();
+            KeyCode::Up | KeyCode::Char('k') => self.settings_field = self.settings_field.checked_sub(1).unwrap_or(2),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.settings_field = (self.settings_field + 1) % 3,
+            KeyCode::Enter | KeyCode::Char('e') => {
+                self.settings_buffer = self.settings_field_value(self.settings_field).unwrap_or_default();
                 self.settings_cursor = self.settings_buffer.chars().count();
                 self.editing_settings = true;
             }
@@ -481,6 +521,14 @@ impl App {
                 };
             }
             _ => {}
+        }
+    }
+
+    fn settings_field_value(&self, field: usize) -> Option<String> {
+        match field {
+            0 => self.spotify_client_id.clone(),
+            1 => self.tidal_client_id.clone(),
+            _ => self.tidal_client_secret.clone(),
         }
     }
 
@@ -875,7 +923,65 @@ impl App {
                 }
             }
             KeyCode::Char('x') => self.stop_playback(),
+            KeyCode::Char('F') => self.start_tidal_search(),
             _ => {}
+        }
+    }
+
+    /// Secret: checks every track in the currently open playlist against Tidal's catalog
+    /// (title + artist match), so you can see which ones aren't available there.
+    fn start_tidal_search(&mut self) {
+        let Some(view) = &self.tracks else { return };
+        if view.tracks.is_empty() {
+            return;
+        }
+        let (Some(client_id), Some(client_secret)) = (self.tidal_client_id.clone(), self.tidal_client_secret.clone()) else {
+            self.message = "Set your Tidal Client ID and Client Secret in Settings (s) first.".into();
+            return;
+        };
+        if self.tidal_search_rx.is_some() {
+            self.message = "Already searching Tidal.".into();
+            return;
+        }
+
+        let entries: Vec<(String, PathBuf, Option<String>)> = view.tracks.iter().map(|track| (track.name.clone(), track.path.clone(), track.remote_metadata.as_ref().map(|remote| remote.artist.clone()))).collect();
+        self.message = "Searching Tidal for these tracks…".into();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let pairs: Vec<(String, String)> = entries
+                .into_iter()
+                .map(|(title, path, remote_artist)| {
+                    let artist = remote_artist.unwrap_or_else(|| metadata::read_track_metadata(&path).and_then(|metadata| metadata.artist).unwrap_or_default());
+                    (title, artist)
+                })
+                .collect();
+            let _ = tx.send(tidal::find_tracks(&client_id, &client_secret, &pairs));
+        });
+        self.tidal_search_rx = Some(rx);
+    }
+
+    /// Call once per frame; non-blocking.
+    pub fn poll_tidal_search(&mut self) {
+        let Some(rx) = &self.tidal_search_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(results)) => {
+                self.tidal_search_rx = None;
+                let missing = results.iter().filter(|found| !**found).count();
+                if let Some(view) = &mut self.tracks {
+                    view.tidal_status = results.into_iter().map(Some).collect();
+                }
+                self.message = if missing == 0 { "All tracks found on Tidal.".into() } else { format!("{missing} track(s) not found on Tidal (marked ✕).") };
+            }
+            Ok(Err(error)) => {
+                self.tidal_search_rx = None;
+                self.message = format!("Tidal search failed: {error}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.tidal_search_rx = None;
+                self.message = "Tidal search thread crashed unexpectedly.".into();
+            }
         }
     }
 
@@ -951,7 +1057,8 @@ impl App {
         let Some(crate_location) = self.crates.iter().find(|crate_location| crate_location.name == crate_name) else { return };
         let Some(playlist) = crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name) else { return };
         let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
-        self.tracks = Some(TrackView { crate_name, playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None });
+        let tidal_status = vec![None; tracks.len()];
+        self.tracks = Some(TrackView { crate_name, playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None, tidal_status });
         self.tag_browser = None;
         self.refresh_selected_track();
     }

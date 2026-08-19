@@ -112,10 +112,16 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
                 ""
             };
             let name_color = if track.remote_metadata.is_some() { BLUE } else if selected { INK } else { CYAN };
+            let tidal_marker = match view.tidal_status.get(index).copied().flatten() {
+                Some(true) => Span::styled("  ✓ tidal", Style::default().fg(LIME)),
+                Some(false) => Span::styled("  ✕ tidal", Style::default().fg(PINK)),
+                None => Span::raw(""),
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{prefix}{}. {playing_marker}", index + 1), Style::default().fg(if app.now_playing == Some(index) { LIME } else { BLUE })),
                 Span::styled(track.name.clone(), Style::default().fg(name_color)),
                 Span::styled(if track.remote_metadata.is_some() { "  ☁" } else { "" }, Style::default().fg(YELLOW)),
+                tidal_marker,
             ]))
         }).collect();
         let mut state = ListState::default();
@@ -537,16 +543,31 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let playlist_count: usize = app.crates.iter().map(|crate_location| crate_location.playlists.len()).sum();
     let path_count: usize = app.crates.iter().map(|crate_location| crate_location.locations.len()).sum();
 
-    let client_id_line = if app.editing_settings {
-        let chars: Vec<char> = app.settings_buffer.chars().collect();
-        let cursor = app.settings_cursor.min(chars.len());
-        let before: String = chars[..cursor].iter().collect();
-        let after: String = chars[cursor..].iter().collect();
-        Line::from(vec![Span::styled(before, Style::default().fg(INK)), Span::styled("█", Style::default().fg(INK)), Span::styled(after, Style::default().fg(INK))])
-    } else {
-        let value = app.spotify_client_id.as_deref().unwrap_or("(not set — press e to add it)");
-        Line::from(Span::styled(format!("  {value}"), Style::default().fg(if app.spotify_client_id.is_some() { CYAN } else { BLUE })))
-    };
+    let field_labels = ["Spotify Client ID", "Tidal Client ID", "Tidal Client Secret"];
+    let field_values = [app.spotify_client_id.as_deref(), app.tidal_client_id.as_deref(), app.tidal_client_secret.as_deref()];
+    let mut credential_lines = Vec::new();
+    for (index, label) in field_labels.iter().enumerate() {
+        let selected = app.settings_field == index;
+        let prefix = if selected { "› " } else { "  " };
+        credential_lines.push(Line::from(Span::styled(format!("{prefix}{label}"), Style::default().fg(if selected { LIME } else { YELLOW }).add_modifier(Modifier::BOLD))));
+        if selected && app.editing_settings {
+            let chars: Vec<char> = app.settings_buffer.chars().collect();
+            let cursor = app.settings_cursor.min(chars.len());
+            let before: String = chars[..cursor].iter().collect();
+            let after: String = chars[cursor..].iter().collect();
+            credential_lines.push(Line::from(vec![Span::styled("    ", Style::default()), Span::styled(before, Style::default().fg(INK)), Span::styled("█", Style::default().fg(INK)), Span::styled(after, Style::default().fg(INK))]));
+        } else {
+            // Mask the secret so it's not shown in plain text on screen.
+            let is_secret = index == 2;
+            let display_value = match field_values[index] {
+                Some(value) if is_secret => "•".repeat(value.chars().count().min(24)),
+                Some(value) => value.to_string(),
+                None => "(not set)".to_string(),
+            };
+            let color = if field_values[index].is_some() { CYAN } else { BLUE };
+            credential_lines.push(Line::from(Span::styled(format!("    {display_value}"), Style::default().fg(color))));
+        }
+    }
 
     let session_line = if app.spotify_refresh_token.is_some() {
         Line::from(vec![Span::styled("  ● connected", Style::default().fg(LIME).add_modifier(Modifier::BOLD)), Span::styled("   (press L to disconnect)", Style::default().fg(BLUE))])
@@ -554,16 +575,17 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![Span::styled("  ○ not connected", Style::default().fg(PINK).add_modifier(Modifier::BOLD)), Span::styled("   (press l to log in)", Style::default().fg(BLUE))])
     };
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled("Status", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(format!("  {}", app.message), Style::default().fg(INK))),
         Line::from(""),
         Line::from(Span::styled("Config file", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(format!("  {}", crate::config::display_path()), Style::default().fg(CYAN))),
         Line::from(""),
-        Line::from(Span::styled("Spotify Client ID", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
-        client_id_line,
-        Line::from(""),
+    ];
+    lines.extend(credential_lines);
+    lines.push(Line::from(""));
+    lines.extend(vec![
         Line::from(Span::styled("Spotify session", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         session_line,
         Line::from(""),
@@ -580,7 +602,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  r           rescan playlists from disk", Style::default().fg(INK))),
         Line::from(Span::styled("  s           this screen", Style::default().fg(INK))),
         Line::from(Span::styled("  q           quit", Style::default().fg(INK))),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(lines).block(panel("⚙ SETTINGS ⚙")), vertical[1]);
     let hint = if app.spotify_login_pending() {
         Line::from(vec![Span::styled("waiting for Spotify login…   ", Style::default().fg(YELLOW)), pill("Esc / c", BACKDROP, PINK), Span::styled(" cancel   ", Style::default().fg(CYAN)), pill("q", PANEL, INK), Span::styled(" quit", Style::default().fg(CYAN))])
@@ -590,8 +612,10 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             pill("Esc / s", BACKDROP, PINK),
             Span::styled(" back   ", Style::default().fg(CYAN)),
-            pill("e", PANEL, INK),
-            Span::styled(" client id   ", Style::default().fg(CYAN)),
+            pill("j/k", PANEL, INK),
+            Span::styled(" select   ", Style::default().fg(CYAN)),
+            pill("Enter / e", PANEL, INK),
+            Span::styled(" edit   ", Style::default().fg(CYAN)),
             pill("l / L", PANEL, INK),
             Span::styled(" connect / disconnect Spotify", Style::default().fg(CYAN)),
         ])
