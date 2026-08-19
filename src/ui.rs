@@ -21,7 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BACKDROP)), area);
     if let Some(view) = &app.tracks {
-        draw_playlist_page(frame, view, area);
+        draw_playlist_page(frame, app, view, area);
         if let Some(index) = app.pending_delete {
             draw_confirm_delete(frame, app, index, area);
         }
@@ -70,10 +70,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_playlist_page(frame: &mut Frame, view: &crate::app::TrackView, area: Rect) {
+fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView, area: Rect) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Length(6), Constraint::Min(6), Constraint::Length(2)])
+        .constraints([Constraint::Length(5), Constraint::Length(6), Constraint::Length(1), Constraint::Min(6), Constraint::Length(2)])
         .split(area);
     draw_header(frame, vertical[0]);
 
@@ -96,18 +96,26 @@ fn draw_playlist_page(frame: &mut Frame, view: &crate::app::TrackView, area: Rec
         Line::from(vec![Span::styled("linked service: ", Style::default().fg(YELLOW)), Span::styled(link_line, Style::default().fg(INK))]),
     ];
     frame.render_widget(Paragraph::new(details).block(panel("♡ PLAYLIST DETAILS ♡")), vertical[1]);
+    frame.render_widget(Paragraph::new(Span::styled(format!("  {}", app.message), Style::default().fg(YELLOW))), vertical[2]);
 
     let track_block = panel("♫ TRACKS ♫");
     if view.tracks.is_empty() {
-        frame.render_widget(Paragraph::new(Span::styled("  No track files found in this playlist's folder.", Style::default().fg(INK))).block(track_block), vertical[2]);
+        frame.render_widget(Paragraph::new(Span::styled("  No track files found in this playlist's folder.", Style::default().fg(INK))).block(track_block), vertical[3]);
     } else {
-        let columns = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(55), Constraint::Percentage(45)]).split(vertical[2]);
+        let columns = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(55), Constraint::Percentage(45)]).split(vertical[3]);
         let items: Vec<ListItem> = view.tracks.iter().enumerate().map(|(index, track)| {
             let selected = index == view.selected;
             let prefix = if selected { "› " } else { "  " };
+            let playing_marker = if app.now_playing == Some(index) {
+                if app.audio_paused { "⏸ " } else { "▶ " }
+            } else {
+                ""
+            };
+            let name_color = if track.remote_metadata.is_some() { BLUE } else if selected { INK } else { CYAN };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{prefix}{}. ", index + 1), Style::default().fg(BLUE)),
-                Span::styled(track.name.clone(), Style::default().fg(if selected { INK } else { CYAN })),
+                Span::styled(format!("{prefix}{}. {playing_marker}", index + 1), Style::default().fg(if app.now_playing == Some(index) { LIME } else { BLUE })),
+                Span::styled(track.name.clone(), Style::default().fg(name_color)),
+                Span::styled(if track.remote_metadata.is_some() { "  ☁" } else { "" }, Style::default().fg(YELLOW)),
             ]))
         }).collect();
         let mut state = ListState::default();
@@ -117,11 +125,15 @@ fn draw_playlist_page(frame: &mut Frame, view: &crate::app::TrackView, area: Rec
     }
 
     frame.render_widget(Paragraph::new(Line::from(vec![
-        pill("Esc / Enter", BACKDROP, PINK),
-        Span::styled(" back to playlists   ", Style::default().fg(CYAN)),
+        pill("Esc", BACKDROP, PINK),
+        Span::styled(" back   ", Style::default().fg(CYAN)),
         pill("j/k", PANEL, INK),
-        Span::styled(" scroll tracks", Style::default().fg(CYAN)),
-    ])), vertical[3]);
+        Span::styled(" scroll   ", Style::default().fg(CYAN)),
+        pill("Enter / p", PANEL, INK),
+        Span::styled(" play / pause   ", Style::default().fg(CYAN)),
+        pill("x", PANEL, INK),
+        Span::styled(" stop", Style::default().fg(CYAN)),
+    ])), vertical[4]);
 }
 
 fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rect) {
@@ -148,12 +160,19 @@ fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rec
         sections[0]
     };
 
+    let is_remote = track.remote_metadata.is_some();
     let extension = std::path::Path::new(&track.name).extension().and_then(|extension| extension.to_str()).unwrap_or("—").to_uppercase();
     let modified = track.modified.map_or("—".to_string(), format_relative_time);
     let metadata = view.metadata.as_ref();
     let field = |value: Option<&String>| value.map_or("—".to_string(), |value| value.clone());
 
-    let mut lines = vec![Line::from(Span::styled(track.name.clone(), Style::default().fg(INK).add_modifier(Modifier::BOLD))), Line::from("")];
+    let mut lines = vec![Line::from(Span::styled(track.name.clone(), Style::default().fg(INK).add_modifier(Modifier::BOLD)))];
+    lines.push(if is_remote {
+        Line::from(Span::styled("☁ metadata only — no local file", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))
+    } else {
+        Line::from(Span::styled("♪ downloaded", Style::default().fg(LIME).add_modifier(Modifier::BOLD)))
+    });
+    lines.push(Line::from(""));
     if let Some(metadata) = metadata {
         lines.push(Line::from(vec![Span::styled("title: ", Style::default().fg(YELLOW)), Span::styled(field(metadata.title.as_ref()), Style::default().fg(INK))]));
         lines.push(Line::from(vec![Span::styled("artist: ", Style::default().fg(YELLOW)), Span::styled(field(metadata.artist.as_ref()), Style::default().fg(INK))]));
@@ -164,10 +183,12 @@ fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rec
     } else {
         lines.push(Line::from(Span::styled("no audio tags found", Style::default().fg(BLUE))));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("format: ", Style::default().fg(YELLOW)), Span::styled(extension, Style::default().fg(CYAN))]));
-    lines.push(Line::from(vec![Span::styled("size: ", Style::default().fg(YELLOW)), Span::styled(format_size(track.size_bytes), Style::default().fg(CYAN))]));
-    lines.push(Line::from(vec![Span::styled("modified: ", Style::default().fg(YELLOW)), Span::styled(modified, Style::default().fg(CYAN))]));
+    if !is_remote {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("format: ", Style::default().fg(YELLOW)), Span::styled(extension, Style::default().fg(CYAN))]));
+        lines.push(Line::from(vec![Span::styled("size: ", Style::default().fg(YELLOW)), Span::styled(format_size(track.size_bytes), Style::default().fg(CYAN))]));
+        lines.push(Line::from(vec![Span::styled("modified: ", Style::default().fg(YELLOW)), Span::styled(modified, Style::default().fg(CYAN))]));
+    }
 
     frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), text_area);
 }
@@ -479,17 +500,25 @@ fn draw_import(frame: &mut Frame, app: &App, area: Rect) {
             let cursor = import.name_cursor.min(chars.len());
             let before: String = chars[..cursor].iter().collect();
             let after: String = chars[cursor..].iter().collect();
-            let label = if import.is_new == Some(true) { "New playlist name (also used as the folder name):" } else { "Playlist name on the service:" };
+            let fetches_online = matches!(import.service, Some(ImportService::Spotify) | Some(ImportService::SoundCloud));
+            let label = match import.service {
+                Some(ImportService::Spotify) => "Paste the Spotify playlist link (open.spotify.com/playlist/...):",
+                Some(ImportService::SoundCloud) => "Paste the SoundCloud playlist link (public playlists only):",
+                _ if import.is_new == Some(true) => "New playlist name (also used as the folder name):",
+                _ => "Playlist name on the service:",
+            };
+            let title = if fetches_online { "✦ PLAYLIST LINK ✦" } else { "✦ PLAYLIST NAME ✦" };
             let lines = vec![
                 Line::from(Span::styled(label, Style::default().fg(YELLOW))),
                 Line::from(""),
                 Line::from(vec![Span::styled(before, Style::default().fg(INK)), Span::styled("█", Style::default().fg(INK)), Span::styled(after, Style::default().fg(INK))]),
             ];
-            frame.render_widget(Paragraph::new(lines).block(panel("✦ PLAYLIST NAME ✦")), vertical[2]);
+            frame.render_widget(Paragraph::new(lines).block(panel(title)), vertical[2]);
         }
     }
 
     let hint = match import.step {
+        ImportStep::Name if matches!(import.service, Some(ImportService::Spotify) | Some(ImportService::SoundCloud)) => "paste the link · Enter fetch tracks · Esc back",
         ImportStep::Name => "type the name · Enter confirm · Esc back",
         _ => "↑/↓ select · Enter confirm · Esc back",
     };
@@ -508,9 +537,35 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let playlist_count: usize = app.crates.iter().map(|crate_location| crate_location.playlists.len()).sum();
     let path_count: usize = app.crates.iter().map(|crate_location| crate_location.locations.len()).sum();
 
+    let client_id_line = if app.editing_settings {
+        let chars: Vec<char> = app.settings_buffer.chars().collect();
+        let cursor = app.settings_cursor.min(chars.len());
+        let before: String = chars[..cursor].iter().collect();
+        let after: String = chars[cursor..].iter().collect();
+        Line::from(vec![Span::styled(before, Style::default().fg(INK)), Span::styled("█", Style::default().fg(INK)), Span::styled(after, Style::default().fg(INK))])
+    } else {
+        let value = app.spotify_client_id.as_deref().unwrap_or("(not set — press e to add it)");
+        Line::from(Span::styled(format!("  {value}"), Style::default().fg(if app.spotify_client_id.is_some() { CYAN } else { BLUE })))
+    };
+
+    let session_line = if app.spotify_refresh_token.is_some() {
+        Line::from(vec![Span::styled("  ● connected", Style::default().fg(LIME).add_modifier(Modifier::BOLD)), Span::styled("   (press L to disconnect)", Style::default().fg(BLUE))])
+    } else {
+        Line::from(vec![Span::styled("  ○ not connected", Style::default().fg(PINK).add_modifier(Modifier::BOLD)), Span::styled("   (press l to log in)", Style::default().fg(BLUE))])
+    };
+
     let lines = vec![
+        Line::from(Span::styled("Status", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("  {}", app.message), Style::default().fg(INK))),
+        Line::from(""),
         Line::from(Span::styled("Config file", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(format!("  {}", crate::config::display_path()), Style::default().fg(CYAN))),
+        Line::from(""),
+        Line::from(Span::styled("Spotify Client ID", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
+        client_id_line,
+        Line::from(""),
+        Line::from(Span::styled("Spotify session", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
+        session_line,
         Line::from(""),
         Line::from(Span::styled("Overview", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(format!("  {crate_count} crates · {path_count} paths · {playlist_count} playlists"), Style::default().fg(INK))),
@@ -527,10 +582,21 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  q           quit", Style::default().fg(INK))),
     ];
     frame.render_widget(Paragraph::new(lines).block(panel("⚙ SETTINGS ⚙")), vertical[1]);
-    frame.render_widget(Paragraph::new(Line::from(vec![
-        pill("Esc / s", BACKDROP, PINK),
-        Span::styled(" back to dashboard", Style::default().fg(CYAN)),
-    ])), vertical[2]);
+    let hint = if app.spotify_login_pending() {
+        Line::from(vec![Span::styled("waiting for Spotify login…   ", Style::default().fg(YELLOW)), pill("Esc / c", BACKDROP, PINK), Span::styled(" cancel   ", Style::default().fg(CYAN)), pill("q", PANEL, INK), Span::styled(" quit", Style::default().fg(CYAN))])
+    } else if app.editing_settings {
+        Line::from(vec![pill("Enter", BACKDROP, PINK), Span::styled(" save   ", Style::default().fg(CYAN)), pill("Esc", PANEL, INK), Span::styled(" cancel", Style::default().fg(CYAN))])
+    } else {
+        Line::from(vec![
+            pill("Esc / s", BACKDROP, PINK),
+            Span::styled(" back   ", Style::default().fg(CYAN)),
+            pill("e", PANEL, INK),
+            Span::styled(" client id   ", Style::default().fg(CYAN)),
+            pill("l / L", PANEL, INK),
+            Span::styled(" connect / disconnect Spotify", Style::default().fg(CYAN)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(hint), vertical[2]);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect) {

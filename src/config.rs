@@ -8,6 +8,10 @@ use crate::model::CrateLocation;
 pub struct AppConfig {
     #[serde(default)]
     pub crates: Vec<CrateLocation>,
+    #[serde(default)]
+    pub spotify_client_id: Option<String>,
+    #[serde(default)]
+    pub spotify_refresh_token: Option<String>,
 }
 
 pub fn load() -> io::Result<Option<AppConfig>> {
@@ -21,14 +25,13 @@ pub fn load() -> io::Result<Option<AppConfig>> {
     Ok(Some(config))
 }
 
-pub fn save(crates: &[CrateLocation]) -> io::Result<()> {
+pub fn save(config: &AppConfig) -> io::Result<()> {
     let path = config_path()?;
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
     }
 
-    let config = AppConfig { crates: crates.to_vec() };
-    let contents = serde_json::to_string_pretty(&config).map_err(io::Error::other)?;
+    let contents = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
     fs::write(path, contents)
 }
 
@@ -72,7 +75,7 @@ mod tests {
             available: true,
             playlists: vec![Playlist { name: "Test playlist".into(), track_count: 10, synced: 5, tags: vec!["test".into()], link: None }],
         }];
-        let config = AppConfig { crates: crates.clone() };
+        let config = AppConfig { crates: crates.clone(), spotify_client_id: None, spotify_refresh_token: None };
         let json = serde_json::to_string(&config).expect("app config should serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("app config should deserialize");
         assert_eq!(restored.crates[0].name, crates[0].name);

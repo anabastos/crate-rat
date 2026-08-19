@@ -6,6 +6,8 @@ use ratatui_image::Resize;
 use crate::config;
 use crate::metadata::{self, TrackMetadata};
 use crate::model::{CrateLocation, ImportService, Location, Playlist, PlaylistLink};
+use crate::soundcloud;
+use crate::spotify;
 use crate::sync;
 use crate::sync::TrackFile;
 
@@ -28,6 +30,41 @@ pub struct App {
     pub import: Option<ImportState>,
     pub tracks: Option<TrackView>,
     picker: Option<Picker>,
+    pub spotify_client_id: Option<String>,
+    pub spotify_refresh_token: Option<String>,
+    pub editing_settings: bool,
+    pub settings_buffer: String,
+    pub settings_cursor: usize,
+    spotify_login_rx: Option<std::sync::mpsc::Receiver<Result<(String, String), String>>>,
+    audio_stream: Option<rodio::OutputStream>,
+    audio_handle: Option<rodio::OutputStreamHandle>,
+    audio_sink: Option<rodio::Sink>,
+    pub now_playing: Option<usize>,
+    pub audio_paused: bool,
+    import_fetch_rx: Option<std::sync::mpsc::Receiver<Result<ImportedPlaylist, String>>>,
+    pending_spotify_import: Option<PendingImport>,
+}
+
+struct PendingImport {
+    service: ImportService,
+    crate_index: usize,
+    playlist_index: usize,
+    is_new: bool,
+}
+
+/// Common shape both spotify::FetchResult and soundcloud::FetchResult get mapped into,
+/// so the fetch/poll/apply pipeline doesn't care which service produced it.
+struct ImportedPlaylist {
+    name: String,
+    tracks: Vec<ImportedTrack>,
+    spotify_refresh_token: Option<String>,
+}
+
+struct ImportedTrack {
+    title: String,
+    artist: String,
+    album: String,
+    duration_secs: u64,
 }
 
 pub struct TrackView {
@@ -95,7 +132,83 @@ impl App {
             import: None,
             tracks: None,
             picker: None,
+            spotify_client_id: None,
+            spotify_refresh_token: None,
+            editing_settings: false,
+            settings_buffer: String::new(),
+            settings_cursor: 0,
+            spotify_login_rx: None,
+            audio_stream: None,
+            audio_handle: None,
+            audio_sink: None,
+            now_playing: None,
+            audio_paused: false,
+            import_fetch_rx: None,
+            pending_spotify_import: None,
         }
+    }
+
+    fn play_track(&mut self, path: &std::path::Path, index: usize) {
+        if self.audio_handle.is_none() {
+            match rodio::OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_stream = Some(stream);
+                    self.audio_handle = Some(handle);
+                }
+                Err(error) => {
+                    self.message = format!("Could not open audio output: {error}");
+                    return;
+                }
+            }
+        }
+        let Some(handle) = &self.audio_handle else { return };
+
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.message = format!("Could not open that track: {error}");
+                return;
+            }
+        };
+        let source = match rodio::Decoder::new(std::io::BufReader::new(file)) {
+            Ok(source) => source,
+            Err(error) => {
+                self.message = format!("Could not decode that track: {error}");
+                return;
+            }
+        };
+        match rodio::Sink::try_new(handle) {
+            Ok(sink) => {
+                sink.append(source);
+                self.audio_sink = Some(sink);
+                self.now_playing = Some(index);
+                self.audio_paused = false;
+                self.message = "▶ playing".into();
+            }
+            Err(error) => self.message = format!("Could not play that track: {error}"),
+        }
+    }
+
+    fn toggle_pause(&mut self) {
+        let Some(sink) = &self.audio_sink else { return };
+        if self.audio_paused {
+            sink.play();
+            self.message = "▶ playing".into();
+        } else {
+            sink.pause();
+            self.message = "⏸ paused".into();
+        }
+        self.audio_paused = !self.audio_paused;
+    }
+
+    fn stop_playback(&mut self) {
+        self.audio_sink = None;
+        self.now_playing = None;
+        self.audio_paused = false;
+    }
+
+    fn save_config(&self) -> std::io::Result<()> {
+        config::save(&config::AppConfig { crates: self.crates.clone(), spotify_client_id: self.spotify_client_id.clone(), spotify_refresh_token: self.spotify_refresh_token.clone() })
     }
 
     fn ensure_picker(&mut self) -> &mut Picker {
@@ -111,7 +224,19 @@ impl App {
     fn refresh_selected_track(&mut self) {
         let Some(view) = &self.tracks else { return };
         let Some(track) = view.tracks.get(view.selected) else { return };
-        let metadata = metadata::read_track_metadata(&track.path);
+        let metadata = if let Some(remote) = &track.remote_metadata {
+            Some(TrackMetadata {
+                title: Some(track.name.clone()),
+                artist: (!remote.artist.is_empty()).then(|| remote.artist.clone()),
+                album: (!remote.album.is_empty()).then(|| remote.album.clone()),
+                year: None,
+                genre: None,
+                duration_secs: remote.duration_secs,
+                cover: None,
+            })
+        } else {
+            metadata::read_track_metadata(&track.path)
+        };
         let cover_bytes = metadata.as_ref().and_then(|metadata| metadata.cover.clone());
 
         let cover = cover_bytes.and_then(|bytes| image::load_from_memory(&bytes).ok()).and_then(|image| {
@@ -130,16 +255,22 @@ impl App {
         let mut app = Self::demo();
         match config::load() {
             Ok(Some(loaded)) if !loaded.crates.is_empty() => {
+                app.spotify_client_id = loaded.spotify_client_id;
+                app.spotify_refresh_token = loaded.spotify_refresh_token;
                 app.crates = loaded.crates;
                 app.message = "Welcome back. Your crate map is loaded.".into();
             }
-            Ok(Some(_)) => app.message = "No crates yet. Press c, then n to add one.".into(),
+            Ok(Some(loaded)) => {
+                app.spotify_client_id = loaded.spotify_client_id;
+                app.spotify_refresh_token = loaded.spotify_refresh_token;
+                app.message = "No crates yet. Press c, then n to add one.".into();
+            }
             Ok(None) => app.message = format!("No config yet. Press c, then n to add a crate. ({})", config::display_path()),
             Err(error) => app.message = format!("Could not load config: {}. Starting with no crates.", error),
         }
         app.refresh_availability();
         app.rescan_playlists();
-        let _ = config::save(&app.crates);
+        let _ = app.save_config();
         app
     }
 
@@ -148,6 +279,18 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.import_fetch_rx.is_some() {
+            match key {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    self.import_fetch_rx = None;
+                    self.pending_spotify_import = None;
+                    self.message = "Import cancelled.".into();
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(index) = self.pending_delete {
             self.handle_confirm_delete(key, index);
             return;
@@ -198,7 +341,7 @@ impl App {
                 self.rescan_playlists();
                 self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
                 let missing: Vec<&str> = self.crates.iter().filter(|crate_location| !crate_location.available).map(|crate_location| crate_location.name.as_str()).collect();
-                let save_note = if config::save(&self.crates).is_ok() { "" } else { " (could not save)" };
+                let save_note = if self.save_config().is_ok() { "" } else { " (could not save)" };
                 self.message = if missing.is_empty() {
                     format!("Playlists rescanned from disk.{save_note}")
                 } else {
@@ -263,12 +406,130 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyCode) {
+        if self.spotify_login_rx.is_some() {
+            match key {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    self.spotify_login_rx = None;
+                    self.message = "Spotify login cancelled.".into();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.editing_settings {
+            match key {
+                KeyCode::Esc => {
+                    self.editing_settings = false;
+                    self.settings_buffer.clear();
+                    self.settings_cursor = 0;
+                }
+                KeyCode::Enter => {
+                    let value = self.settings_buffer.trim().to_string();
+                    self.spotify_client_id = if value.is_empty() { None } else { Some(value) };
+                    self.editing_settings = false;
+                    self.settings_buffer.clear();
+                    self.settings_cursor = 0;
+                    self.message = match self.save_config() {
+                        Ok(()) => "Spotify Client ID saved.".into(),
+                        Err(error) => format!("Saved for this session, but could not write config: {error}"),
+                    };
+                }
+                KeyCode::Left => self.settings_cursor = self.settings_cursor.saturating_sub(1),
+                KeyCode::Right => self.settings_cursor = (self.settings_cursor + 1).min(self.settings_buffer.chars().count()),
+                KeyCode::Home => self.settings_cursor = 0,
+                KeyCode::End => self.settings_cursor = self.settings_buffer.chars().count(),
+                KeyCode::Backspace => {
+                    if self.settings_cursor > 0 {
+                        let byte_index = char_byte_index(&self.settings_buffer, self.settings_cursor - 1);
+                        self.settings_buffer.remove(byte_index);
+                        self.settings_cursor -= 1;
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.settings_cursor < self.settings_buffer.chars().count() {
+                        let byte_index = char_byte_index(&self.settings_buffer, self.settings_cursor);
+                        self.settings_buffer.remove(byte_index);
+                    }
+                }
+                KeyCode::Char(character) => {
+                    let byte_index = char_byte_index(&self.settings_buffer, self.settings_cursor);
+                    self.settings_buffer.insert(byte_index, character);
+                    self.settings_cursor += 1;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc | KeyCode::Char('s') => {
                 self.screen = Screen::Dashboard;
             }
+            KeyCode::Char('e') => {
+                self.settings_buffer = self.spotify_client_id.clone().unwrap_or_default();
+                self.settings_cursor = self.settings_buffer.chars().count();
+                self.editing_settings = true;
+            }
+            KeyCode::Char('l') => self.spotify_login(),
+            KeyCode::Char('L') if self.spotify_refresh_token.is_some() => {
+                self.spotify_refresh_token = None;
+                self.message = match self.save_config() {
+                    Ok(()) => "Disconnected from Spotify.".into(),
+                    Err(error) => format!("Disconnected, but could not save config: {error}"),
+                };
+            }
             _ => {}
+        }
+    }
+
+    /// Runs the actual login (browser + local callback server + token exchange) on a
+    /// background thread, so the UI keeps redrawing and responding to keys (q to quit, etc.)
+    /// while it waits. `poll_spotify_login` picks up the result once it's ready.
+    fn spotify_login(&mut self) {
+        let Some(client_id) = self.spotify_client_id.clone() else {
+            self.message = "Set a Spotify Client ID first (press e).".into();
+            return;
+        };
+        if self.spotify_login_rx.is_some() {
+            self.message = "Already waiting on a Spotify login.".into();
+            return;
+        }
+        self.message = "Opening your browser to log in to Spotify… (up to 2 min — Esc to cancel)".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(spotify::login(&client_id));
+        });
+        self.spotify_login_rx = Some(rx);
+    }
+
+    pub fn spotify_login_pending(&self) -> bool {
+        self.spotify_login_rx.is_some()
+    }
+
+    /// Call once per frame; non-blocking. Applies the login result as soon as the
+    /// background thread finishes.
+    pub fn poll_spotify_login(&mut self) {
+        let Some(rx) = &self.spotify_login_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((_access_token, refresh_token))) => {
+                self.spotify_refresh_token = Some(refresh_token);
+                self.message = match self.save_config() {
+                    Ok(()) => "Connected to Spotify.".into(),
+                    Err(error) => format!("Connected, but could not save config: {error}"),
+                };
+                self.spotify_login_rx = None;
+            }
+            Ok(Err(error)) => {
+                self.message = format!("Spotify login failed: {error}");
+                self.spotify_login_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.message = "Spotify login thread crashed unexpectedly.".into();
+                self.spotify_login_rx = None;
+            }
         }
     }
 
@@ -404,9 +665,21 @@ impl App {
 
     fn finalize_import(&mut self) {
         let Some(current) = &self.import else { return };
+        let fetches_online = matches!(current.service, Some(ImportService::Spotify) | Some(ImportService::SoundCloud));
         if current.name_buffer.trim().is_empty() {
-            self.message = "Playlist name can't be empty.".into();
+            self.message = if fetches_online { "Paste a playlist link.".into() } else { "Playlist name can't be empty.".into() };
             return;
+        }
+        if let Some(service) = current.service {
+            if fetches_online {
+                let link = current.name_buffer.trim().to_string();
+                let is_new = current.is_new.unwrap_or(true);
+                let crate_index = current.crate_index;
+                let playlist_index = current.playlist_index;
+                self.import = None;
+                self.start_online_import(service, crate_index, playlist_index, is_new, &link);
+                return;
+            }
         }
 
         let Some(import) = self.import.take() else { return };
@@ -438,7 +711,7 @@ impl App {
                     playlist.link = Some(PlaylistLink { service, external_name: external_name.clone() });
                 }
             }
-            self.message = match config::save(&self.crates) {
+            self.message = match self.save_config() {
                 Ok(()) => format!("Created \"{external_name}\" and linked it to {}.", service.label()),
                 Err(error) => format!("Created the playlist, but could not save config: {error}"),
             };
@@ -449,7 +722,7 @@ impl App {
                     playlist.link = Some(PlaylistLink { service, external_name: external_name.clone() });
                 }
             }
-            self.message = match config::save(&self.crates) {
+            self.message = match self.save_config() {
                 Ok(()) => format!("Linked to {} playlist \"{external_name}\".", service.label()),
                 Err(error) => format!("Linked for this session, but could not save config: {error}"),
             };
@@ -457,10 +730,125 @@ impl App {
         self.screen = Screen::Dashboard;
     }
 
+    /// Kicks off the track-metadata fetch (Spotify login happens on that thread too, if
+    /// needed) on a background thread and returns to the dashboard immediately.
+    /// `poll_spotify_import` picks up the result once it's ready.
+    fn start_online_import(&mut self, service: ImportService, crate_index: usize, playlist_index: usize, is_new: bool, link: &str) {
+        let link = link.to_string();
+        self.message = format!("Fetching tracks from {}… (up to 2 min — Esc to cancel)", service.label());
+        self.screen = Screen::Dashboard;
+        self.pending_spotify_import = Some(PendingImport { service, crate_index, playlist_index, is_new });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        match service {
+            ImportService::Spotify => {
+                let Some(client_id) = self.spotify_client_id.clone() else {
+                    self.message = "Set a Spotify Client ID in Settings (s) first.".into();
+                    self.pending_spotify_import = None;
+                    return;
+                };
+                let refresh_token = self.spotify_refresh_token.clone();
+                std::thread::spawn(move || {
+                    let result = spotify::fetch_playlist(&client_id, refresh_token.as_deref(), &link).map(|fetched| ImportedPlaylist {
+                        name: fetched.name,
+                        tracks: fetched.tracks.into_iter().map(|track| ImportedTrack { title: track.title, artist: track.artist, album: track.album, duration_secs: track.duration_secs }).collect(),
+                        spotify_refresh_token: Some(fetched.refresh_token),
+                    });
+                    let _ = tx.send(result);
+                });
+            }
+            ImportService::SoundCloud => {
+                std::thread::spawn(move || {
+                    let result = soundcloud::fetch_public_playlist(&link).map(|fetched| ImportedPlaylist {
+                        name: fetched.name,
+                        tracks: fetched.tracks.into_iter().map(|track| ImportedTrack { title: track.title, artist: track.artist, album: String::new(), duration_secs: track.duration_secs }).collect(),
+                        spotify_refresh_token: None,
+                    });
+                    let _ = tx.send(result);
+                });
+            }
+            ImportService::Tidal => {
+                let _ = tx.send(Err("Tidal import isn't implemented yet.".into()));
+            }
+        }
+        self.import_fetch_rx = Some(rx);
+    }
+
+    /// Call once per frame; non-blocking.
+    pub fn poll_spotify_import(&mut self) {
+        let Some(rx) = &self.import_fetch_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.import_fetch_rx = None;
+                if let Some(pending) = self.pending_spotify_import.take() {
+                    self.apply_online_import(pending, result);
+                }
+            }
+            Ok(Err(error)) => {
+                self.import_fetch_rx = None;
+                self.pending_spotify_import = None;
+                self.message = format!("Import failed: {error}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.import_fetch_rx = None;
+                self.pending_spotify_import = None;
+                self.message = "Import thread crashed unexpectedly.".into();
+            }
+        }
+    }
+
+    fn apply_online_import(&mut self, pending: PendingImport, result: ImportedPlaylist) {
+        if let Some(refresh_token) = &result.spotify_refresh_token {
+            self.spotify_refresh_token = Some(refresh_token.clone());
+        }
+
+        let folder_name = if pending.is_new {
+            result.name.clone()
+        } else {
+            self.crates.get(pending.crate_index).and_then(|crate_location| crate_location.playlists.get(pending.playlist_index)).map_or_else(|| result.name.clone(), |playlist| playlist.name.clone())
+        };
+
+        if let Some(crate_location) = self.crates.get(pending.crate_index) {
+            if let Some(primary) = crate_location.locations.first() {
+                let folder = std::path::Path::new(&primary.path).join(&folder_name);
+                if let Err(error) = std::fs::create_dir_all(&folder) {
+                    self.message = format!("Could not create playlist folder: {error}");
+                    return;
+                }
+                let manifest: Vec<serde_json::Value> = result.tracks.iter().map(|track| serde_json::json!({"title": track.title, "artist": track.artist, "album": track.album, "duration_secs": track.duration_secs})).collect();
+                if let Ok(contents) = serde_json::to_string_pretty(&manifest) {
+                    let filename = format!("{}-tracks.json", pending.service.label().to_lowercase());
+                    let _ = std::fs::write(folder.join(filename), contents);
+                }
+            } else {
+                self.message = "That crate has no paths yet.".into();
+                return;
+            }
+        }
+
+        let track_count = result.tracks.len();
+        if let Some(crate_location) = self.crates.get_mut(pending.crate_index) {
+            let scanned = sync::scan_crate_playlists(crate_location);
+            crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
+            if let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&folder_name)) {
+                playlist.link = Some(PlaylistLink { service: pending.service, external_name: result.name.clone() });
+            }
+        }
+
+        self.message = match self.save_config() {
+            Ok(()) => format!("Pulled {track_count} tracks from {} playlist \"{}\".", pending.service.label(), result.name),
+            Err(error) => format!("Pulled {track_count} tracks, but could not save config: {error}"),
+        };
+    }
+
     fn handle_tracks_key(&mut self, key: KeyCode) {
         let Some(view) = &mut self.tracks else { return };
         match key {
-            KeyCode::Esc | KeyCode::Enter => self.tracks = None,
+            KeyCode::Esc => {
+                self.stop_playback();
+                self.tracks = None;
+            }
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 if !view.tracks.is_empty() {
@@ -474,6 +862,19 @@ impl App {
                     self.refresh_selected_track();
                 }
             }
+            KeyCode::Enter | KeyCode::Char('p') => {
+                let Some(track) = view.tracks.get(view.selected) else { return };
+                let selected = view.selected;
+                if track.remote_metadata.is_some() {
+                    self.message = "This track is metadata only (no local audio file) — nothing to play.".into();
+                } else if self.now_playing == Some(selected) {
+                    self.toggle_pause();
+                } else {
+                    let path = track.path.clone();
+                    self.play_track(&path, selected);
+                }
+            }
+            KeyCode::Char('x') => self.stop_playback(),
             _ => {}
         }
     }
@@ -486,7 +887,7 @@ impl App {
                     self.selected_crate = self.selected_crate.min(self.crates.len().saturating_sub(1));
                     self.config_field = 0;
                     self.message = format!("Removed crate {}.", removed.name);
-                    if let Err(error) = config::save(&self.crates) {
+                    if let Err(error) = self.save_config() {
                         self.message = format!("Removed crate {}, but could not save config: {}", removed.name, error);
                     }
                 }
@@ -602,7 +1003,7 @@ impl App {
         self.editing_tags = false;
         self.tag_buffer.clear();
         self.tag_cursor = 0;
-        self.message = match config::save(&self.crates) {
+        self.message = match self.save_config() {
             Ok(()) => "Tags saved.".into(),
             Err(error) => format!("Tags updated for this session, but could not save config: {}", error),
         };
@@ -687,7 +1088,7 @@ impl App {
                     self.message = format!("Marked as {state}.");
                 }
                 self.refresh_availability();
-                let _ = config::save(&self.crates);
+                let _ = self.save_config();
             }
             KeyCode::Char('n') => {
                 self.crates.push(CrateLocation { name: "New crate".into(), locations: vec![Location { path: String::new(), removable: false }], available: true, playlists: vec![] });
@@ -750,7 +1151,7 @@ impl App {
             self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
         }
         self.editing_config = false;
-        self.message = match (config::save(&self.crates), path_not_found) {
+        self.message = match (self.save_config(), path_not_found) {
             (Ok(()), Some(path)) => format!("Saved, but that path doesn't exist: {path}"),
             (Ok(()), None) if path_changed => "Saved. Playlists scanned from that path's folders.".into(),
             (Ok(()), None) => format!("Saved. Your crate map is looking lovely. ({})", config::display_path()),

@@ -15,6 +15,11 @@ thiserror = "2"
 lofty = "0.21"
 image = "0.25"
 ratatui-image = "1.0"
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+rodio = "0.19"
 
 [profile.release]
 lto = true
