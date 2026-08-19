@@ -636,8 +636,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_header(frame: &mut Frame, area: Rect) {
     let title = Line::from(vec![
-        Span::styled("rat", Style::default().fg(PANEL).bg(PINK).add_modifier(Modifier::BOLD)),
         Span::styled("crate", Style::default().fg(PANEL).bg(LIME).add_modifier(Modifier::BOLD)),
+        Span::styled("rat", Style::default().fg(PANEL).bg(PINK).add_modifier(Modifier::BOLD)),
         Span::styled(" crate manager", Style::default().fg(CYAN)),
     ]);
     let subtitle = Line::from(Span::styled("🐀 🐁 🐭 🐹", Style::default().fg(YELLOW)));

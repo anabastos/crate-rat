@@ -1,4 +1,4 @@
-# ratcrate
+# Crate Rat
 
 A terminal crate manager for DJs who keep the same playlists mirrored across multiple drives.
 
@@ -24,7 +24,7 @@ local tracks (with cover art and metadata) right from the terminal.
 - **Spotify → Tidal → download**: for a Spotify-imported (metadata-only) playlist, find each
   track on Tidal and download it via the externally-installed
   [`tidal-dl-ng`](https://github.com/exislow/tidal-dl-ng) (needs its own real Tidal login/
-  subscription — RatCrate just calls it).
+  subscription — Crate Rat just calls it).
 - Playlists that only have imported metadata (no downloaded audio) are shown with a ☁ marker and
   can't be played — only ones with real local files can.
 
@@ -79,12 +79,12 @@ background so the UI never freezes; `Esc` cancels one in progress.
 
 1. Create an app at [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard),
    add redirect URI `http://127.0.0.1:8888/callback`, enable the Web API.
-2. Copy the **Client ID** (no secret needed — RatCrate uses PKCE) into `s` → select the field →
-   `Enter`/`e` in RatCrate.
+2. Copy the **Client ID** (no secret needed — Crate Rat uses PKCE) into `s` → select the field →
+   `Enter`/`e` in Crate Rat.
 3. `s` → `l` to log in (opens your browser). `L` disconnects.
 4. Note: reading a private playlist requires the account that *owns the Spotify app* to have an
    active Premium subscription and to be added under the app's User Management if it's still in
-   Development Mode — this is a Spotify-side restriction, not a RatCrate one.
+   Development Mode — this is a Spotify-side restriction, not a Crate Rat one.
 
 ### Tidal setup (one-time)
 
