@@ -37,6 +37,8 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), B
         app.poll_spotify_login();
         app.poll_spotify_import();
         app.poll_tidal_search();
+        app.poll_soundcloud_download();
+        app.poll_spotify_tidal_download();
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if event::poll(std::time::Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {

@@ -36,6 +36,8 @@ impl Playlist {
 pub struct PlaylistLink {
     pub service: ImportService,
     pub external_name: String,
+    #[serde(default)]
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

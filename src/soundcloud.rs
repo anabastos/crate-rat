@@ -1,6 +1,8 @@
-//! Public-playlist metadata via SoundCloud's undocumented api-v2, the same approach used by
-//! most open-source SoundCloud tools (scdl, yt-dlp, etc.) since SoundCloud's official API
-//! registration is manual-approval-only. Only reads public data — no login, no private access.
+//! Public-playlist track downloading via SoundCloud's undocumented api-v2, the same approach
+//! used by most open-source SoundCloud tools (scdl, yt-dlp, etc.) since SoundCloud's official
+//! API registration is manual-approval-only. Only touches public data — no login required.
+
+use std::{fs, io, path::Path};
 
 pub struct SoundCloudTrack {
     pub title: String,
@@ -11,9 +13,14 @@ pub struct SoundCloudTrack {
 pub struct FetchResult {
     pub name: String,
     pub tracks: Vec<SoundCloudTrack>,
+    pub failed: usize,
 }
 
-pub fn fetch_public_playlist(playlist_link: &str) -> Result<FetchResult, String> {
+/// Resolves a public playlist link and downloads every track's actual audio (not just
+/// metadata) into `<crate_path>/<folder_name>/`, where `folder_name` is `existing_folder_name`
+/// if linking to an already-known local playlist, or the SoundCloud playlist's own title
+/// otherwise.
+pub fn download_playlist(playlist_link: &str, crate_path: &str, existing_folder_name: Option<&str>) -> Result<FetchResult, String> {
     let client_id = fetch_public_client_id()?;
     let resolve_url = format!("https://api-v2.soundcloud.com/resolve?url={}&client_id={client_id}", percent_encode(playlist_link.trim()));
 
@@ -25,39 +32,75 @@ pub fn fetch_public_playlist(playlist_link: &str) -> Result<FetchResult, String>
     let name = response["title"].as_str().unwrap_or("SoundCloud Playlist").to_string();
     let raw_tracks = response["tracks"].as_array().cloned().unwrap_or_default();
 
-    let mut tracks = Vec::new();
+    let mut full_tracks = Vec::new();
     let mut stub_ids = Vec::new();
-    for track in &raw_tracks {
-        if track.get("title").is_some() {
-            tracks.push(parse_track(track));
+    for track in raw_tracks {
+        if track.get("media").is_some() {
+            full_tracks.push(track);
         } else if let Some(id) = track["id"].as_u64() {
             stub_ids.push(id);
         }
     }
-
-    // Large playlists come back with "stub" entries (just an id) for tracks past the first page;
-    // fetch those in batches to get their real title/artist/duration.
+    // Large playlists come back with "stub" entries (just an id) for tracks past the first
+    // page; fetch those in batches to get the full track object (with its transcodings).
     for chunk in stub_ids.chunks(50) {
         let ids = chunk.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
         let url = format!("https://api-v2.soundcloud.com/tracks?ids={ids}&client_id={client_id}");
         if let Ok(response) = ureq::get(&url).call() {
             if let Ok(list) = response.into_json::<Vec<serde_json::Value>>() {
-                for track in &list {
-                    tracks.push(parse_track(track));
-                }
+                full_tracks.extend(list);
             }
         }
     }
 
-    Ok(FetchResult { name, tracks })
+    let folder_name = existing_folder_name.unwrap_or(&name);
+    let dest_dir = Path::new(crate_path).join(folder_name);
+    fs::create_dir_all(&dest_dir).map_err(|error| format!("could not create playlist folder: {error}"))?;
+
+    let mut tracks = Vec::new();
+    let mut failed = 0;
+    for track in &full_tracks {
+        let title = track["title"].as_str().unwrap_or("Unknown track").to_string();
+        let artist = track["user"]["username"].as_str().unwrap_or("").to_string();
+        let duration_secs = track["duration"].as_u64().unwrap_or(0) / 1000;
+        match download_track(&client_id, track, &dest_dir, &title) {
+            Ok(()) => tracks.push(SoundCloudTrack { title, artist, duration_secs }),
+            Err(_) => failed += 1,
+        }
+    }
+
+    if tracks.is_empty() && failed > 0 {
+        return Err(format!("could not download any of the {failed} track(s) (Go+ exclusive tracks aren't downloadable this way)"));
+    }
+    Ok(FetchResult { name, tracks, failed })
 }
 
-fn parse_track(track: &serde_json::Value) -> SoundCloudTrack {
-    SoundCloudTrack {
-        title: track["title"].as_str().unwrap_or("Unknown track").to_string(),
-        artist: track["user"]["username"].as_str().unwrap_or("").to_string(),
-        duration_secs: track["duration"].as_u64().unwrap_or(0) / 1000,
-    }
+fn download_track(client_id: &str, track: &serde_json::Value, dest_dir: &Path, title: &str) -> Result<(), String> {
+    let transcodings = track["media"]["transcodings"].as_array().cloned().unwrap_or_default();
+    let chosen = transcodings
+        .iter()
+        .find(|transcoding| transcoding["format"]["protocol"].as_str() == Some("progressive"))
+        .ok_or_else(|| "no downloadable (progressive) stream — likely Go+ exclusive".to_string())?;
+
+    let transcoding_url = chosen["url"].as_str().ok_or("missing transcoding url")?;
+    let resolved: serde_json::Value = ureq::get(&format!("{transcoding_url}?client_id={client_id}")).call().map_err(|error| format!("could not resolve stream: {}", describe_error(error)))?.into_json().map_err(|error| format!("bad stream response: {error}"))?;
+    let stream_url = resolved["url"].as_str().ok_or("no stream url in response")?;
+
+    let mime = chosen["format"]["mime_type"].as_str().unwrap_or("audio/mpeg");
+    let extension = if mime.contains("ogg") || mime.contains("opus") { "opus" } else { "mp3" };
+
+    let response = ureq::get(stream_url).call().map_err(|error| format!("stream fetch failed: {}", describe_error(error)))?;
+    let mut reader = response.into_reader();
+    let path = dest_dir.join(format!("{}.{extension}", sanitize_filename(title)));
+    let mut file = fs::File::create(&path).map_err(|error| format!("could not write file: {error}"))?;
+    io::copy(&mut reader, &mut file).map_err(|error| format!("download failed: {error}"))?;
+    Ok(())
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name.chars().map(|character| if "\\/:*?\"<>|".contains(character) { '_' } else { character }).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() { "track".to_string() } else { trimmed.to_string() }
 }
 
 /// SoundCloud's public web player embeds a `client_id` in its JS bundles; scrape it the same

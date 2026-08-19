@@ -130,7 +130,8 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
         draw_track_details(frame, view, columns[1]);
     }
 
-    frame.render_widget(Paragraph::new(Line::from(vec![
+    let link_service = view.playlist.link.as_ref().map(|link| link.service);
+    let mut footer = vec![
         pill("Esc", BACKDROP, PINK),
         Span::styled(" back   ", Style::default().fg(CYAN)),
         pill("j/k", PANEL, INK),
@@ -139,7 +140,17 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
         Span::styled(" play / pause   ", Style::default().fg(CYAN)),
         pill("x", PANEL, INK),
         Span::styled(" stop", Style::default().fg(CYAN)),
-    ])), vertical[4]);
+    ];
+    if let Some(label) = match link_service {
+        Some(crate::model::ImportService::SoundCloud) => Some("download audio"),
+        Some(crate::model::ImportService::Spotify) => Some("find + download via Tidal"),
+        _ => None,
+    } {
+        footer.push(Span::styled("   ", Style::default()));
+        footer.push(pill("D", PANEL, INK));
+        footer.push(Span::styled(format!(" {label}"), Style::default().fg(CYAN)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer)), vertical[4]);
 }
 
 fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rect) {

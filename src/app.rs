@@ -50,6 +50,8 @@ pub struct App {
     import_fetch_rx: Option<std::sync::mpsc::Receiver<Result<ImportedPlaylist, String>>>,
     pending_spotify_import: Option<PendingImport>,
     tidal_search_rx: Option<std::sync::mpsc::Receiver<Result<Vec<bool>, String>>>,
+    soundcloud_download_rx: Option<std::sync::mpsc::Receiver<Result<soundcloud::FetchResult, String>>>,
+    spotify_tidal_download_rx: Option<std::sync::mpsc::Receiver<Result<(usize, usize), String>>>,
 }
 
 struct PendingImport {
@@ -57,6 +59,7 @@ struct PendingImport {
     crate_index: usize,
     playlist_index: usize,
     is_new: bool,
+    link: String,
 }
 
 /// Common shape both spotify::FetchResult and soundcloud::FetchResult get mapped into,
@@ -158,6 +161,8 @@ impl App {
             import_fetch_rx: None,
             pending_spotify_import: None,
             tidal_search_rx: None,
+            soundcloud_download_rx: None,
+            spotify_tidal_download_rx: None,
         }
     }
 
@@ -309,6 +314,28 @@ impl App {
                     self.import_fetch_rx = None;
                     self.pending_spotify_import = None;
                     self.message = "Import cancelled.".into();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.soundcloud_download_rx.is_some() {
+            match key {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    self.soundcloud_download_rx = None;
+                    self.message = "Download cancelled.".into();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.spotify_tidal_download_rx.is_some() {
+            match key {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    self.spotify_tidal_download_rx = None;
+                    self.message = "Download cancelled.".into();
                 }
                 _ => {}
             }
@@ -756,7 +783,7 @@ impl App {
                 let scanned = sync::scan_crate_playlists(crate_location);
                 crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
                 if let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&external_name)) {
-                    playlist.link = Some(PlaylistLink { service, external_name: external_name.clone() });
+                    playlist.link = Some(PlaylistLink { service, external_name: external_name.clone(), source_url: None });
                 }
             }
             self.message = match self.save_config() {
@@ -767,7 +794,7 @@ impl App {
             let playlist_index = import.playlist_index;
             if let Some(crate_location) = self.crates.get_mut(crate_index) {
                 if let Some(playlist) = crate_location.playlists.get_mut(playlist_index) {
-                    playlist.link = Some(PlaylistLink { service, external_name: external_name.clone() });
+                    playlist.link = Some(PlaylistLink { service, external_name: external_name.clone(), source_url: None });
                 }
             }
             self.message = match self.save_config() {
@@ -785,7 +812,7 @@ impl App {
         let link = link.to_string();
         self.message = format!("Fetching tracks from {}… (up to 2 min — Esc to cancel)", service.label());
         self.screen = Screen::Dashboard;
-        self.pending_spotify_import = Some(PendingImport { service, crate_index, playlist_index, is_new });
+        self.pending_spotify_import = Some(PendingImport { service, crate_index, playlist_index, is_new, link: link.clone() });
 
         let (tx, rx) = std::sync::mpsc::channel();
         match service {
@@ -806,8 +833,15 @@ impl App {
                 });
             }
             ImportService::SoundCloud => {
+                let folder_hint = if is_new { None } else { self.crates.get(crate_index).and_then(|crate_location| crate_location.playlists.get(playlist_index)).map(|playlist| playlist.name.clone()) };
+                let Some(primary_path) = self.crates.get(crate_index).and_then(|crate_location| crate_location.locations.first()).map(|location| location.path.clone()) else {
+                    self.message = "That crate has no paths yet.".into();
+                    self.pending_spotify_import = None;
+                    return;
+                };
+                self.message = "Downloading tracks from SoundCloud… (up to 2 min — Esc to cancel)".into();
                 std::thread::spawn(move || {
-                    let result = soundcloud::fetch_public_playlist(&link).map(|fetched| ImportedPlaylist {
+                    let result = soundcloud::download_playlist(&link, &primary_path, folder_hint.as_deref()).map(|fetched| ImportedPlaylist {
                         name: fetched.name,
                         tracks: fetched.tracks.into_iter().map(|track| ImportedTrack { title: track.title, artist: track.artist, album: String::new(), duration_secs: track.duration_secs }).collect(),
                         spotify_refresh_token: None,
@@ -857,21 +891,27 @@ impl App {
             self.crates.get(pending.crate_index).and_then(|crate_location| crate_location.playlists.get(pending.playlist_index)).map_or_else(|| result.name.clone(), |playlist| playlist.name.clone())
         };
 
-        if let Some(crate_location) = self.crates.get(pending.crate_index) {
-            if let Some(primary) = crate_location.locations.first() {
-                let folder = std::path::Path::new(&primary.path).join(&folder_name);
-                if let Err(error) = std::fs::create_dir_all(&folder) {
-                    self.message = format!("Could not create playlist folder: {error}");
+        // SoundCloud tracks are already downloaded as real audio files by the time we get here
+        // (soundcloud::download_playlist wrote them straight into the playlist folder); only
+        // metadata-only services (Spotify — no downloadable stream via their API) need the
+        // manifest fallback so their tracks show up as something.
+        if pending.service != ImportService::SoundCloud {
+            if let Some(crate_location) = self.crates.get(pending.crate_index) {
+                if let Some(primary) = crate_location.locations.first() {
+                    let folder = std::path::Path::new(&primary.path).join(&folder_name);
+                    if let Err(error) = std::fs::create_dir_all(&folder) {
+                        self.message = format!("Could not create playlist folder: {error}");
+                        return;
+                    }
+                    let manifest: Vec<serde_json::Value> = result.tracks.iter().map(|track| serde_json::json!({"title": track.title, "artist": track.artist, "album": track.album, "duration_secs": track.duration_secs})).collect();
+                    if let Ok(contents) = serde_json::to_string_pretty(&manifest) {
+                        let filename = format!("{}-tracks.json", pending.service.label().to_lowercase());
+                        let _ = std::fs::write(folder.join(filename), contents);
+                    }
+                } else {
+                    self.message = "That crate has no paths yet.".into();
                     return;
                 }
-                let manifest: Vec<serde_json::Value> = result.tracks.iter().map(|track| serde_json::json!({"title": track.title, "artist": track.artist, "album": track.album, "duration_secs": track.duration_secs})).collect();
-                if let Ok(contents) = serde_json::to_string_pretty(&manifest) {
-                    let filename = format!("{}-tracks.json", pending.service.label().to_lowercase());
-                    let _ = std::fs::write(folder.join(filename), contents);
-                }
-            } else {
-                self.message = "That crate has no paths yet.".into();
-                return;
             }
         }
 
@@ -880,7 +920,7 @@ impl App {
             let scanned = sync::scan_crate_playlists(crate_location);
             crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
             if let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&folder_name)) {
-                playlist.link = Some(PlaylistLink { service: pending.service, external_name: result.name.clone() });
+                playlist.link = Some(PlaylistLink { service: pending.service, external_name: result.name.clone(), source_url: Some(pending.link.clone()) });
             }
         }
 
@@ -924,7 +964,193 @@ impl App {
             }
             KeyCode::Char('x') => self.stop_playback(),
             KeyCode::Char('F') => self.start_tidal_search(),
+            KeyCode::Char('D') => self.start_download(),
             _ => {}
+        }
+    }
+
+    /// Downloads the real audio for the currently open playlist from SoundCloud (needs the
+    /// playlist to be linked to a SoundCloud playlist first, via `i`).
+    fn start_download(&mut self) {
+        let Some(view) = &self.tracks else { return };
+        let Some(service) = view.playlist.link.as_ref().map(|link| link.service) else {
+            self.message = "This playlist isn't linked to a service yet. Use i to import/link one.".into();
+            return;
+        };
+        match service {
+            ImportService::SoundCloud => self.start_soundcloud_download(),
+            ImportService::Spotify => self.start_spotify_tidal_download(),
+            ImportService::Tidal => self.message = "This playlist is already from Tidal.".into(),
+        }
+    }
+
+    fn start_soundcloud_download(&mut self) {
+        let Some(view) = &self.tracks else { return };
+        let Some(link) = view.playlist.link.as_ref() else {
+            self.message = "This playlist isn't linked to SoundCloud yet. Use i to import/link one.".into();
+            return;
+        };
+        let Some(source_url) = link.source_url.clone() else {
+            self.message = "This playlist's SoundCloud link is missing — re-link it via i.".into();
+            return;
+        };
+        if self.soundcloud_download_rx.is_some() {
+            self.message = "Already downloading.".into();
+            return;
+        }
+        let Some(primary_path) = self.crates.iter().find(|crate_location| crate_location.name == view.crate_name).and_then(|crate_location| crate_location.locations.first()).map(|location| location.path.clone()) else {
+            self.message = "That crate has no paths yet.".into();
+            return;
+        };
+        let folder_name = view.playlist.name.clone();
+
+        self.message = "Downloading tracks from SoundCloud… (up to 2 min — Esc to cancel)".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(soundcloud::download_playlist(&source_url, &primary_path, Some(&folder_name)));
+        });
+        self.soundcloud_download_rx = Some(rx);
+    }
+
+    /// Call once per frame; non-blocking.
+    pub fn poll_soundcloud_download(&mut self) {
+        let Some(rx) = &self.soundcloud_download_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.soundcloud_download_rx = None;
+                let downloaded = result.tracks.len();
+                self.message = if result.failed == 0 { format!("Downloaded {downloaded} track(s) from SoundCloud.") } else { format!("Downloaded {downloaded} track(s), {} failed (likely Go+ exclusive).", result.failed) };
+
+                // Rescan so the crate's playlist reflects the newly downloaded files, and
+                // refresh the open track view so the ☁ metadata-only markers go away.
+                let names = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone()));
+                if let Some((crate_name, playlist_name)) = names {
+                    if let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == crate_name) {
+                        let scanned = sync::scan_crate_playlists(crate_location);
+                        crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
+                    }
+                    let _ = self.save_config();
+
+                    let refreshed = self.crates.iter().find(|crate_location| crate_location.name == crate_name).and_then(|crate_location| {
+                        let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
+                        crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
+                    });
+
+                    if let Some((playlist, tracks)) = refreshed {
+                        let tidal_status = vec![None; tracks.len()];
+                        if let Some(view) = &mut self.tracks {
+                            view.playlist = playlist;
+                            view.tracks = tracks;
+                            view.tidal_status = tidal_status;
+                            view.selected = 0;
+                        }
+                    }
+                    self.refresh_selected_track();
+                }
+            }
+            Ok(Err(error)) => {
+                self.soundcloud_download_rx = None;
+                self.message = format!("SoundCloud download failed: {error}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.soundcloud_download_rx = None;
+                self.message = "Download thread crashed unexpectedly.".into();
+            }
+        }
+    }
+
+    /// For a Spotify-linked playlist (metadata only — Spotify's API has no downloadable
+    /// stream): finds each track on Tidal's catalog, then hands the matches off to the
+    /// externally-installed `tidal-dl-ng` (which needs its own real Tidal login) to download
+    /// them straight into the playlist's folder.
+    fn start_spotify_tidal_download(&mut self) {
+        let Some(view) = &self.tracks else { return };
+        let (Some(client_id), Some(client_secret)) = (self.tidal_client_id.clone(), self.tidal_client_secret.clone()) else {
+            self.message = "Set your Tidal Client ID and Client Secret in Settings (s) first.".into();
+            return;
+        };
+        if self.spotify_tidal_download_rx.is_some() {
+            self.message = "Already downloading.".into();
+            return;
+        }
+        let Some(primary_path) = self.crates.iter().find(|crate_location| crate_location.name == view.crate_name).and_then(|crate_location| crate_location.locations.first()).map(|location| location.path.clone()) else {
+            self.message = "That crate has no paths yet.".into();
+            return;
+        };
+        let folder_name = view.playlist.name.clone();
+        // Only tracks that don't already have a local file need to be found/downloaded.
+        let pairs: Vec<(String, String)> = view.tracks.iter().filter(|track| track.remote_metadata.is_some()).map(|track| (track.name.clone(), track.remote_metadata.as_ref().map(|remote| remote.artist.clone()).unwrap_or_default())).collect();
+        if pairs.is_empty() {
+            self.message = "Nothing left to download — every track already has a local file.".into();
+            return;
+        }
+
+        self.message = "Searching Tidal and downloading via tidal-dl-ng… (Esc to cancel)".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dest_dir = std::path::Path::new(&primary_path).join(&folder_name);
+            let result = tidal::find_track_urls(&client_id, &client_secret, &pairs).map(|matches| {
+                let mut downloaded = 0usize;
+                let mut failed = 0usize;
+                for maybe_url in matches {
+                    match maybe_url {
+                        Some(url) => match tidal::download_via_tidal_dl_ng(&url, &dest_dir) {
+                            Ok(()) => downloaded += 1,
+                            Err(_) => failed += 1,
+                        },
+                        None => failed += 1,
+                    }
+                }
+                (downloaded, failed)
+            });
+            let _ = tx.send(result);
+        });
+        self.spotify_tidal_download_rx = Some(rx);
+    }
+
+    /// Call once per frame; non-blocking.
+    pub fn poll_spotify_tidal_download(&mut self) {
+        let Some(rx) = &self.spotify_tidal_download_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((downloaded, failed))) => {
+                self.spotify_tidal_download_rx = None;
+                self.message = if failed == 0 { format!("Downloaded {downloaded} track(s) via Tidal.") } else { format!("Downloaded {downloaded} track(s) via Tidal, {failed} not found or failed.") };
+
+                let names = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone()));
+                if let Some((crate_name, playlist_name)) = names {
+                    if let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == crate_name) {
+                        let scanned = sync::scan_crate_playlists(crate_location);
+                        crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
+                    }
+                    let _ = self.save_config();
+
+                    let refreshed = self.crates.iter().find(|crate_location| crate_location.name == crate_name).and_then(|crate_location| {
+                        let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
+                        crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
+                    });
+
+                    if let Some((playlist, tracks)) = refreshed {
+                        let tidal_status = vec![None; tracks.len()];
+                        if let Some(view) = &mut self.tracks {
+                            view.playlist = playlist;
+                            view.tracks = tracks;
+                            view.tidal_status = tidal_status;
+                            view.selected = 0;
+                        }
+                    }
+                    self.refresh_selected_track();
+                }
+            }
+            Ok(Err(error)) => {
+                self.spotify_tidal_download_rx = None;
+                self.message = format!("Tidal download failed: {error}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.spotify_tidal_download_rx = None;
+                self.message = "Download thread crashed unexpectedly.".into();
+            }
         }
     }
 
