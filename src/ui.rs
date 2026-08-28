@@ -25,6 +25,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         if let Some(index) = app.pending_delete {
             draw_confirm_delete(frame, app, index, area);
         }
+        if let Some(log) = &app.tidal_log {
+            draw_download_log(frame, log, area);
+        }
         return;
     }
     match app.screen {
@@ -68,6 +71,70 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(browser) = &app.tag_browser {
         draw_tag_browser(frame, browser, area);
     }
+    if let Some(log) = &app.tidal_log {
+        draw_download_log(frame, log, area);
+    }
+}
+
+fn draw_download_log(frame: &mut Frame, log: &crate::app::DownloadLog, area: Rect) {
+    let popup = centered_rect(86, 76, area);
+    frame.render_widget(Clear, popup);
+
+    let sections = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(3), Constraint::Length(1)]).split(popup);
+
+    if log.single_pane {
+        draw_log_pane(frame, "DOWNLOADING TRACKS", &log.downloading, log.downloading_selected, true, sections[0]);
+    } else {
+        let panes = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(50), Constraint::Percentage(50)]).split(sections[0]);
+        let finding_focused = log.focused_pane == crate::app::LogPhase::Finding;
+        draw_log_pane(frame, "FINDING TRACKS", &log.finding, log.finding_selected, finding_focused, panes[0]);
+        draw_log_pane(frame, "DOWNLOADING TRACKS", &log.downloading, log.downloading_selected, !finding_focused, panes[1]);
+    }
+
+    let mut footer = vec![pill("j/k", PANEL, INK), Span::styled(" scroll   ", Style::default().fg(CYAN))];
+    if !log.single_pane {
+        footer.push(pill("Tab", PANEL, INK));
+        footer.push(Span::styled(" switch pane   ", Style::default().fg(CYAN)));
+    }
+    footer.push(pill("Esc", PANEL, INK));
+    footer.push(Span::styled(" close", Style::default().fg(CYAN)));
+    frame.render_widget(Paragraph::new(Line::from(footer)).style(Style::default().bg(PANEL)), sections[1]);
+}
+
+fn draw_log_pane(frame: &mut Frame, title_label: &str, entries: &[(String, String)], selected: usize, focused: bool, area: Rect) {
+    let border_color = if focused { LIME } else { BLUE };
+    let block = Block::default()
+        .title(Span::styled(format!(" ♫ {title_label} ({}) ♫ ", entries.len()), Style::default().fg(PANEL).bg(border_color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(PANEL));
+
+    if entries.is_empty() {
+        frame.render_widget(Paragraph::new(Span::styled("  (nothing logged yet)", Style::default().fg(BLUE))).block(block), area);
+        return;
+    }
+
+    // borders (2) + horizontal padding (2)
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = entries.iter().enumerate().map(|(index, (title, outcome))| {
+        let row_selected = index == selected;
+        let prefix = if row_selected { "› " } else { "  " };
+        if title == "batch" {
+            let lines: Vec<Line> = wrap_text(&format!("{prefix}▸ {outcome}"), inner_width).into_iter().map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)))).collect();
+            return ListItem::new(lines);
+        }
+        let outcome_color = if outcome == "downloaded" { LIME } else { PINK };
+        let mut lines: Vec<Line> = wrap_text(&format!("{prefix}{title}"), inner_width).into_iter().map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(if row_selected { INK } else { CYAN })))).collect();
+        for chunk in wrap_text(outcome, inner_width.saturating_sub(4)) {
+            lines.push(Line::from(Span::styled(format!("    {chunk}"), Style::default().fg(outcome_color))));
+        }
+        ListItem::new(lines)
+    }).collect();
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(List::new(items).block(block).highlight_style(Style::default().bg(Color::Rgb(40, 0, 35)).fg(INK).add_modifier(Modifier::BOLD)), area, &mut state);
 }
 
 fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView, area: Rect) {
@@ -78,7 +145,7 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
     draw_header(frame, vertical[0]);
 
     let playlist = &view.playlist;
-    let status_color = if playlist.synced == playlist.track_count { LIME } else { PINK };
+    let status_color = if playlist.link.is_some() && playlist.track_count == 0 { PINK } else if playlist.synced == playlist.track_count { LIME } else { PINK };
     let tags_line = if playlist.tags.is_empty() { "—".to_string() } else { playlist.tags.join(", ") };
     let link_line = playlist.link.as_ref().map_or("—".to_string(), |link| format!("{} · \"{}\"", link.service.label(), link.external_name));
 
@@ -144,11 +211,17 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
     if let Some(label) = match link_service {
         Some(crate::model::ImportService::SoundCloud) => Some("download audio"),
         Some(crate::model::ImportService::Spotify) => Some("find + download via Tidal"),
+        Some(crate::model::ImportService::Tidal) => Some("download via tidal-dl-ng"),
         _ => None,
     } {
         footer.push(Span::styled("   ", Style::default()));
         footer.push(pill("D", PANEL, INK));
         footer.push(Span::styled(format!(" {label}"), Style::default().fg(CYAN)));
+    }
+    if link_service == Some(crate::model::ImportService::Tidal) {
+        footer.push(Span::styled("   ", Style::default()));
+        footer.push(pill("R", PANEL, INK));
+        footer.push(Span::styled(" refresh from Tidal", Style::default().fg(CYAN)));
     }
     frame.render_widget(Paragraph::new(Line::from(footer)), vertical[4]);
 }
@@ -554,8 +627,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let playlist_count: usize = app.crates.iter().map(|crate_location| crate_location.playlists.len()).sum();
     let path_count: usize = app.crates.iter().map(|crate_location| crate_location.locations.len()).sum();
 
-    let field_labels = ["Spotify Client ID", "Tidal Client ID", "Tidal Client Secret"];
-    let field_values = [app.spotify_client_id.as_deref(), app.tidal_client_id.as_deref(), app.tidal_client_secret.as_deref()];
+    let field_labels = ["Spotify Client ID", "Tidal Client ID", "Tidal Client Secret", "Tidal Country Code"];
+    let field_values = [app.spotify_client_id.as_deref(), app.tidal_client_id.as_deref(), app.tidal_client_secret.as_deref(), app.tidal_country_code.as_deref()];
     let mut credential_lines = Vec::new();
     for (index, label) in field_labels.iter().enumerate() {
         let selected = app.settings_field == index;
@@ -573,6 +646,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             let display_value = match field_values[index] {
                 Some(value) if is_secret => "•".repeat(value.chars().count().min(24)),
                 Some(value) => value.to_string(),
+                None if index == 3 => "(not set, defaults to BR)".to_string(),
                 None => "(not set)".to_string(),
             };
             let color = if field_values[index].is_some() { CYAN } else { BLUE };
@@ -691,7 +765,7 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let rows = crate_location.playlists.iter().map(|playlist| {
-        let status_color = if playlist.synced == playlist.track_count { LIME } else { PINK };
+        let status_color = if playlist.link.is_some() && playlist.track_count == 0 { PINK } else if playlist.synced == playlist.track_count { LIME } else { PINK };
         let name = playlist.link.as_ref().map_or_else(|| playlist.name.clone(), |link| format!("{} [{}]", playlist.name, link.service.label()));
         Row::new(vec![name, format!("{}/{}", playlist.synced, playlist.track_count), playlist.status().to_string(), playlist.tags.join("  ")]).style(Style::default().fg(INK)).style(Style::default().fg(status_color))
     });

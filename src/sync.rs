@@ -21,6 +21,9 @@ pub struct RemoteTrackMetadata {
     pub artist: String,
     pub album: String,
     pub duration_secs: u64,
+    /// The track's id on the source service (currently only populated for Tidal), so a missing
+    /// track can be downloaded directly by id instead of having to be searched for first.
+    pub external_id: Option<String>,
 }
 
 /// Scans every path belonging to `crate_location` and builds playlists from the subfolders found:
@@ -28,8 +31,8 @@ pub struct RemoteTrackMetadata {
 /// Playlists (matched case-insensitively) and files within a playlist are deduplicated, so adding
 /// another path that mirrors an existing one doesn't create duplicate entries.
 pub fn scan_crate_playlists(crate_location: &CrateLocation) -> Vec<Playlist> {
-    // key: lowercased playlist name -> (display name, best known track count, locations that have it)
-    let mut found: BTreeMap<String, (String, usize, usize)> = BTreeMap::new();
+    // key: lowercased playlist name -> (display name, best known track count, best known downloaded count, locations that have it)
+    let mut found: BTreeMap<String, (String, usize, usize, usize)> = BTreeMap::new();
 
     for location in &crate_location.locations {
         let Ok(entries) = fs::read_dir(&location.path) else {
@@ -50,17 +53,19 @@ pub fn scan_crate_playlists(crate_location: &CrateLocation) -> Vec<Playlist> {
                 continue;
             }
             let track_count = track_count_for(&path);
-            let slot = found.entry(key).or_insert_with(|| (name.clone(), 0, 0));
+            let downloaded_count = count_unique_files(&path);
+            let slot = found.entry(key).or_insert_with(|| (name.clone(), 0, 0, 0));
             slot.1 = slot.1.max(track_count);
-            slot.2 += 1;
+            slot.2 = slot.2.max(downloaded_count);
+            slot.3 += 1;
         }
     }
 
     let location_count = crate_location.locations.len().max(1);
     found
         .into_values()
-        .map(|(name, track_count, seen_in)| {
-            let synced = if seen_in >= location_count { track_count } else { 0 };
+        .map(|(name, track_count, downloaded_count, seen_in)| {
+            let synced = if seen_in >= location_count { downloaded_count.min(track_count) } else { 0 };
             Playlist { name, track_count, synced, tags: Vec::new(), link: None }
         })
         .collect()
@@ -130,11 +135,18 @@ pub fn list_playlist_tracks(crate_location: &CrateLocation, playlist_name: &str)
                 })
                 .collect();
 
-            if tracks.is_empty() {
-                if let Some(manifest) = find_manifest(&path) {
-                    if let Some(manifest_tracks) = read_manifest(&manifest) {
-                        return manifest_tracks;
-                    }
+            // Add back manifest entries for tracks that haven't been downloaded yet (matched by
+            // whether any local filename contains the manifest title), so a playlist that's
+            // partially downloaded still shows what's missing instead of losing the rest of the
+            // manifest the moment the first real file lands.
+            if let Some(manifest) = find_manifest(&path) {
+                if let Some(manifest_tracks) = read_manifest(&manifest) {
+                    let local_names: Vec<String> = tracks.iter().map(|track| normalize_for_match(&track.name)).collect();
+                    let missing = manifest_tracks.into_iter().filter(|manifest_track| {
+                        let title = normalize_for_match(&manifest_track.name);
+                        !local_names.iter().any(|local_name| local_name.contains(&title))
+                    });
+                    tracks.extend(missing);
                 }
             }
 
@@ -143,6 +155,39 @@ pub fn list_playlist_tracks(crate_location: &CrateLocation, playlist_name: &str)
         }
     }
     Vec::new()
+}
+
+/// Loosened comparison for matching a manifest title against a local filename: lowercased, with
+/// punctuation stripped and whitespace collapsed, since downloaders routinely rename tracks just
+/// enough (dropping quotes/colons, tweaking "Remaster" formatting, etc.) that a literal substring
+/// match on the raw title fails even though it's clearly the same track.
+fn normalize_for_match(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_was_space = false;
+    for character in text.to_lowercase().chars() {
+        if character.is_alphanumeric() {
+            out.push(character);
+            last_was_space = false;
+        } else if !last_was_space {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Removes the entry matching `title` (exact, case-sensitive — titles come from the same
+/// manifest this reads/writes, so no fuzzy matching is needed) from `dir`'s import manifest, if
+/// one exists. Called right after a track is confirmed downloaded, so the manifest stops
+/// claiming a track is "not downloaded yet" the moment a real file exists for it — more reliable
+/// than re-deriving that from filename matching on every scan.
+pub fn remove_manifest_entry(dir: &Path, title: &str) -> std::io::Result<()> {
+    let Some(manifest) = find_manifest(dir) else { return Ok(()) };
+    let contents = fs::read_to_string(&manifest)?;
+    let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&contents) else { return Ok(()) };
+    entries.retain(|entry| entry["title"].as_str() != Some(title));
+    let contents = serde_json::to_string_pretty(&entries)?;
+    fs::write(&manifest, contents)
 }
 
 fn read_manifest(manifest: &Path) -> Option<Vec<TrackFile>> {
@@ -160,6 +205,7 @@ fn read_manifest(manifest: &Path) -> Option<Vec<TrackFile>> {
                     artist: entry["artist"].as_str().unwrap_or("").to_string(),
                     album: entry["album"].as_str().unwrap_or("").to_string(),
                     duration_secs: entry["duration_secs"].as_u64().unwrap_or(0),
+                    external_id: entry["id"].as_str().map(str::to_string),
                 }),
             })
             .collect(),

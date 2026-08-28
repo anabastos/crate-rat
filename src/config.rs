@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub tidal_client_id: Option<String>,
     #[serde(default)]
     pub tidal_client_secret: Option<String>,
+    #[serde(default)]
+    pub tidal_country_code: Option<String>,
 }
 
 pub fn load() -> io::Result<Option<AppConfig>> {
@@ -79,7 +81,7 @@ mod tests {
             available: true,
             playlists: vec![Playlist { name: "Test playlist".into(), track_count: 10, synced: 5, tags: vec!["test".into()], link: None }],
         }];
-        let config = AppConfig { crates: crates.clone(), spotify_client_id: None, spotify_refresh_token: None, tidal_client_id: None, tidal_client_secret: None };
+        let config = AppConfig { crates: crates.clone(), spotify_client_id: None, spotify_refresh_token: None, tidal_client_id: None, tidal_client_secret: None, tidal_country_code: None };
         let json = serde_json::to_string(&config).expect("app config should serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("app config should deserialize");
         assert_eq!(restored.crates[0].name, crates[0].name);

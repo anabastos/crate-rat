@@ -21,10 +21,12 @@ local tracks (with cover art and metadata) right from the terminal.
   needed. Downloads the actual audio (progressive streams only; Go+-exclusive tracks are skipped).
 - **Tidal catalog search**: check which tracks in a playlist exist on Tidal (app-only, no user
   login — just a Client ID/Secret from Settings).
+- **Tidal import + download**: paste a Tidal playlist link to link it (looks up just the name via
+  the app-only Client ID/Secret); pressing `D` then downloads the whole playlist in one go via the
+  externally-installed [`tidal-dl-ng`](https://github.com/exislow/tidal-dl-ng) `dl <link>` (needs
+  its own real Tidal login/subscription — Crate Rat just calls it).
 - **Spotify → Tidal → download**: for a Spotify-imported (metadata-only) playlist, find each
-  track on Tidal and download it via the externally-installed
-  [`tidal-dl-ng`](https://github.com/exislow/tidal-dl-ng) (needs its own real Tidal login/
-  subscription — Crate Rat just calls it).
+  track on Tidal and download it via `tidal-dl-ng` track by track instead.
 - Playlists that only have imported metadata (no downloaded audio) are shown with a ☁ marker and
   can't be played — only ones with real local files can.
 
@@ -66,13 +68,15 @@ Saving a path rescans that crate's folders and updates its playlists.
 - `j`/`k` — scroll tracks (shows cover art + tags for the highlighted one)
 - `Enter` / `p` — play/pause the selected track · `x` — stop · `Esc` — back
 - `D` — download real audio for this playlist: pulls from SoundCloud directly if it's
-  SoundCloud-linked, or finds + downloads via Tidal (`tidal-dl-ng`) if it's Spotify-linked. Runs
-  in the background with a status message; `Esc` cancels.
+  SoundCloud-linked, finds + downloads via Tidal (`tidal-dl-ng`) track by track if it's
+  Spotify-linked, or downloads the whole playlist in one `tidal-dl-ng dl <link>` call if it's
+  Tidal-linked (can take several minutes for a big playlist). Runs in the background with a
+  status message; `Esc` cancels.
 
 ### Import (`i`)
 
 Pick a service → new playlist or link to an existing one → pick a crate (and playlist, if
-linking) → paste a link (Spotify/SoundCloud) or type a name (manual). Fetches run in the
+linking) → paste a link (Spotify/SoundCloud/Tidal) or type a name (manual). Fetches run in the
 background so the UI never freezes; `Esc` cancels one in progress.
 
 ### Spotify setup (one-time)
@@ -92,9 +96,10 @@ background so the UI never freezes; `Esc` cancels one in progress.
    and **Client Secret**.
 2. Set both in `s` (Settings) — used for catalog search only (app-only Client Credentials flow,
    no user login).
-3. To actually download Tidal matches for a Spotify playlist (`D`), separately install and log
-   into [`tidal-dl-ng`](https://github.com/exislow/tidal-dl-ng) (`pip install tidal-dl-ng`) — that
-   needs your own Tidal subscription and its own login, unrelated to the Client ID/Secret above.
+3. To actually download audio (`D` on a Tidal- or Spotify-linked playlist), separately install and
+   log into [`tidal-dl-ng`](https://github.com/exislow/tidal-dl-ng) (`pip install tidal-dl-ng`) —
+   that needs your own Tidal subscription and its own login, unrelated to the Client ID/Secret
+   above.
 
 ## Direction
 

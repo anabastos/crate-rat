@@ -36,7 +36,7 @@ pub fn fetch_playlist(client_id: &str, stored_refresh_token: Option<&str>, playl
     };
 
     let name = fetch_playlist_name(&access_token, &playlist_id)?;
-    let tracks = fetch_all_tracks(&access_token, &playlist_id)?;
+    let tracks = fetch_all_items(&access_token, &playlist_id)?;
     Ok(FetchResult { name, tracks, refresh_token })
 }
 
@@ -172,18 +172,18 @@ fn fetch_playlist_name(access_token: &str, playlist_id: &str) -> Result<String, 
     Ok(response["name"].as_str().unwrap_or("Spotify Playlist").to_string())
 }
 
-fn fetch_all_tracks(access_token: &str, playlist_id: &str) -> Result<Vec<SpotifyTrack>, String> {
+fn fetch_all_items(access_token: &str, playlist_id: &str) -> Result<Vec<SpotifyTrack>, String> {
     let mut url = format!(
-        "https://api.spotify.com/v1/playlists/{playlist_id}/tracks?fields=next,items(track(name,duration_ms,artists(name),album(name)))&limit=50"
+        "https://api.spotify.com/v1/playlists/{playlist_id}/items?fields=next,items(item(name,duration_ms,artists(name),album(name)))&limit=50"
     );
     let mut tracks = Vec::new();
 
     loop {
-        let response: serde_json::Value = ureq::get(&url).set("Authorization", &format!("Bearer {access_token}")).call().map_err(|error| format!("could not fetch tracks: {}", describe_error(error)))?.into_json().map_err(|error| format!("bad tracks response: {error}"))?;
+        let response: serde_json::Value = ureq::get(&url).set("Authorization", &format!("Bearer {access_token}")).call().map_err(|error| format!("could not fetch items: {}", describe_error(error)))?.into_json().map_err(|error| format!("bad items response: {error}"))?;
 
         let items = response["items"].as_array().cloned().unwrap_or_default();
-        for item in items {
-            let track = &item["track"];
+        for entry in items {
+            let track = &entry["item"];
             if track.is_null() {
                 continue;
             }
