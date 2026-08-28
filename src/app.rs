@@ -1596,42 +1596,45 @@ impl App {
         std::thread::spawn(move || {
             let dest_dir = std::path::Path::new(&primary_path).join(&folder_name);
             let total = pairs.len();
-            let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Finding));
-            let _ = tx.send(TidalDownloadUpdate::Log { title: "batch".to_string(), line: format!("finding {total} track(s)…") });
-            let progress_tx = tx.clone();
-            let log_tx = tx.clone();
-            let result = tidal::find_track_urls(
-                &client_id,
-                &client_secret,
-                &country_code,
-                &pairs,
-                |index, title| {
-                    let _ = progress_tx.send(TidalDownloadUpdate::Progress { index, total, title: title.to_string() });
-                },
-                |title, line| {
-                    let _ = log_tx.send(TidalDownloadUpdate::Log { title: title.to_string(), line: line.to_string() });
-                },
-            )
-            .map(|matches| {
-                let found = matches.iter().filter(|url| url.is_some()).count();
-                let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Downloading));
-                let _ = tx.send(TidalDownloadUpdate::Log { title: "batch".to_string(), line: format!("{found} found — downloading via tidal-dl-ng…") });
-                {
-                    let mut cfg_log = |line: &str| { let _ = tx.send(TidalDownloadUpdate::Log { title: "batch".to_string(), line: line.to_string() }); };
-                    if let Err(error) = tidal::set_tidal_dl_ng_download_path(&dest_dir, &mut cfg_log) {
-                        cfg_log(&format!("could not set tidal-dl-ng download path: {error}"));
-                    }
+            {
+                let mut cfg_log = |line: &str| { let _ = tx.send(TidalDownloadUpdate::Log { title: "batch".to_string(), line: line.to_string() }); };
+                if let Err(error) = tidal::set_tidal_dl_ng_download_path(&dest_dir, &mut cfg_log) {
+                    cfg_log(&format!("could not set tidal-dl-ng download path: {error}"));
                 }
+            }
+
+            // Finding and downloading interleave per track (find one, download it right away,
+            // then find the next) rather than finding the whole batch before downloading
+            // anything — so the download panel starts filling in immediately instead of sitting
+            // empty until every track has been searched for. Both panels stay populated as
+            // normal; only the order work happens in changed, not what gets shown.
+            let result: Result<TidalDownloadOutcome, String> = (|| {
+                let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Finding));
+                let auth_log_tx = tx.clone();
+                let mut finder = tidal::TrackFinder::new(&client_id, &client_secret, |line| {
+                    let _ = auth_log_tx.send(TidalDownloadUpdate::Log { title: "auth".to_string(), line: line.to_string() });
+                })?;
+
                 let mut downloaded = 0usize;
                 let mut log = Vec::with_capacity(pairs.len());
-                for ((title, _artist), maybe_url) in pairs.iter().zip(matches) {
-                    match maybe_url {
-                        Some(url) => {
+                for (index, (title, artist)) in pairs.iter().enumerate() {
+                    let _ = tx.send(TidalDownloadUpdate::Progress { index: index + 1, total, title: title.clone() });
+                    let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Finding));
+                    let find_log_tx = tx.clone();
+                    let find_title = title.clone();
+                    let found = finder.find_track_url(&country_code, title, artist, |line| {
+                        let _ = find_log_tx.send(TidalDownloadUpdate::Log { title: find_title.clone(), line: line.to_string() });
+                    });
+
+                    let status = match found {
+                        Ok(Some(url)) => {
+                            let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: "found — downloading via tidal-dl-ng…".to_string() });
+                            let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Downloading));
                             let line_tx = tx.clone();
                             let outcome = tidal::download_via_tidal_dl_ng(&url, |line| {
                                 let _ = line_tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: line.to_string() });
                             });
-                            let status = match outcome {
+                            match outcome {
                                 Ok(()) => {
                                     downloaded += 1;
                                     // The manifest is the only thing driving "still needs
@@ -1641,18 +1644,16 @@ impl App {
                                     "downloaded".to_string()
                                 }
                                 Err(error) => format!("download failed: {error}"),
-                            };
-                            let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: status.clone() });
-                            log.push((title.clone(), status));
+                            }
                         }
-                        None => {
-                            let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: "not found on Tidal".to_string() });
-                            log.push((title.clone(), "not found on Tidal".to_string()));
-                        }
-                    }
+                        Ok(None) => "not found on Tidal".to_string(),
+                        Err(error) => format!("search error: {error}"),
+                    };
+                    let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: status.clone() });
+                    log.push((title.clone(), status));
                 }
-                TidalDownloadOutcome { downloaded, log, has_more }
-            });
+                Ok(TidalDownloadOutcome { downloaded, log, has_more })
+            })();
             let _ = tx.send(TidalDownloadUpdate::Done(result));
         });
         self.spotify_tidal_download_rx = Some(rx);

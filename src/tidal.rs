@@ -38,34 +38,37 @@ pub fn find_tracks(client_id: &str, client_secret: &str, country_code: &str, tra
     Ok(results)
 }
 
-/// Same search as `find_tracks`, but returns each match's Tidal track URL (when found) instead
-/// of just a bool, so the caller can hand it off to `tidal-dl-ng`. Calls `on_progress(1-based
-/// index, title)` right before each track is looked up, so a caller polling from another thread
-/// can show which track is in flight. Calls `on_log(title, line)` for every Tidal API request
-/// made while resolving that track, so the caller can show a full request-by-request trace.
-pub fn find_track_urls(client_id: &str, client_secret: &str, country_code: &str, tracks: &[(String, String)], mut on_progress: impl FnMut(usize, &str), mut on_log: impl FnMut(&str, &str)) -> Result<Vec<Option<String>>, String> {
-    let mut access_token = get_app_token(client_id, client_secret, &mut |line| on_log("auth", line))?;
-    let mut cache = ArtistCache::default();
-    let mut results = Vec::with_capacity(tracks.len());
-    for (index, (title, artist)) in tracks.iter().enumerate() {
-        on_progress(index + 1, title);
-        let mut log = |line: &str| on_log(title, line);
-        match search_track_url(&access_token, country_code, title, artist, &mut cache, &mut log) {
-            Ok(url) => results.push(url),
-            // Same expiring-token situation as above: refresh once and retry this track
-            // in place, instead of aborting the whole batch and making the user press D again.
+/// One track at a time under caller control, so a caller can interleave each find with something
+/// else (e.g. downloading the previous match) rather than finding a whole batch before
+/// downloading anything. Keeps the access token and artist cache alive across calls, so looping
+/// this doesn't cost an extra auth request or repeat artist lookups per track.
+pub struct TrackFinder {
+    client_id: String,
+    client_secret: String,
+    access_token: String,
+    cache: ArtistCache,
+}
+
+impl TrackFinder {
+    pub fn new(client_id: &str, client_secret: &str, mut on_log: impl FnMut(&str)) -> Result<Self, String> {
+        let access_token = get_app_token(client_id, client_secret, &mut on_log)?;
+        Ok(TrackFinder { client_id: client_id.to_string(), client_secret: client_secret.to_string(), access_token, cache: ArtistCache::default() })
+    }
+
+    pub fn find_track_url(&mut self, country_code: &str, title: &str, artist: &str, mut on_log: impl FnMut(&str)) -> Result<Option<String>, String> {
+        match search_track_url(&self.access_token, country_code, title, artist, &mut self.cache, &mut on_log) {
+            Ok(url) => Ok(url),
             Err(error) if is_auth_error(&error) => {
-                log(&format!("auth error, refreshing token: {error}"));
-                access_token = get_app_token(client_id, client_secret, &mut log)?;
-                results.push(search_track_url(&access_token, country_code, title, artist, &mut cache, &mut log).unwrap_or(None));
+                on_log(&format!("auth error, refreshing token: {error}"));
+                self.access_token = get_app_token(&self.client_id, &self.client_secret, &mut on_log)?;
+                Ok(search_track_url(&self.access_token, country_code, title, artist, &mut self.cache, &mut on_log).unwrap_or(None))
             }
             Err(error) => {
-                log(&format!("search error: {error}"));
-                results.push(None);
+                on_log(&format!("search error: {error}"));
+                Ok(None)
             }
         }
     }
-    Ok(results)
 }
 
 /// Whether a search failure looks like an auth/authorization problem (bad or expired
