@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
@@ -6,13 +7,23 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::Resize;
 
 use crate::config;
+use crate::library::{self, Library, LibraryTrack, TagStatus};
 use crate::metadata::{self, TrackMetadata};
+use crate::player;
 use crate::model::{CrateLocation, ImportService, Location, Playlist, PlaylistLink};
 use crate::soundcloud;
 use crate::spotify;
 use crate::sync;
 use crate::sync::TrackFile;
+use crate::tags::{TagJob, TagUpdate, TagWorker};
 use crate::tidal;
+
+/// Tag lookups finished between library saves (the queue draining always saves too).
+const TAG_SAVE_EVERY: usize = 10;
+/// Spotify ID, Tidal ID/secret/country, Last.fm key, cloud backup folder.
+pub const SETTINGS_FIELDS: usize = 6;
+/// Minimum time between automatic cloud backup writes (quitting always writes one).
+const BACKUP_MIN_INTERVAL_SECS: u64 = 60;
 
 /// Max tracks searched/downloaded from Tidal per press of `D`, so a huge playlist doesn't turn
 /// into an unattended hours-long batch — press `D` again to work through the rest.
@@ -51,8 +62,31 @@ pub struct App {
     audio_stream: Option<rodio::OutputStream>,
     audio_handle: Option<rodio::OutputStreamHandle>,
     audio_sink: Option<rodio::Sink>,
-    pub now_playing: Option<usize>,
+    /// File currently loaded in the audio sink.
+    pub now_playing: Option<PathBuf>,
     pub audio_paused: bool,
+    /// Every track, once — playlists only hold ids pointing in here.
+    pub library: Library,
+    /// Track id -> every (crate, playlist) holding it. Derived from `crates`, never saved.
+    pub track_playlists: HashMap<String, Vec<(String, String)>>,
+    pub library_browser: Option<LibraryBrowser>,
+    pub lastfm_api_key: Option<String>,
+    pub cloud_backup_dir: Option<String>,
+    /// Result of the last cloud backup write: when it happened, or why it failed.
+    pub backup_status: Option<Result<u64, String>>,
+    tag_worker: Option<TagWorker>,
+    /// Track ids waiting in the tag worker's queue.
+    tag_queued: HashSet<String>,
+    /// Track whose tags are being looked up right now.
+    pub tag_in_flight: Option<String>,
+    /// Tracks whose lookup failed (network/API) this session — not retried until next launch
+    /// or an explicit `g`.
+    pub tag_errors: HashSet<String>,
+    tag_results_since_save: usize,
+    library_dirty: bool,
+    /// Tidal-linked playlists (crate, playlist) the background refresh still has to check;
+    /// the first one is being fetched right now.
+    pub tidal_refresh_queue: Vec<(String, String)>,
     import_fetch_rx: Option<std::sync::mpsc::Receiver<Result<ImportedPlaylist, String>>>,
     pending_spotify_import: Option<PendingImport>,
     tidal_search_rx: Option<std::sync::mpsc::Receiver<Result<Vec<bool>, String>>>,
@@ -126,6 +160,8 @@ pub struct TrackView {
     pub crate_name: String,
     pub playlist: Playlist,
     pub tracks: Vec<TrackFile>,
+    /// Library id of each entry of `tracks` (same order/length).
+    pub track_ids: Vec<String>,
     pub selected: usize,
     pub metadata: Option<TrackMetadata>,
     pub cover: Option<Box<dyn Protocol>>,
@@ -218,6 +254,42 @@ impl DownloadLog {
     }
 }
 
+/// What's going on with a playlist right now, for the dashboard's SYNC column.
+pub enum Activity {
+    /// Being checked against Tidal (`true`) or waiting its turn (`false`).
+    Tidal(bool),
+    Importing,
+    Downloading,
+    /// Tracks still waiting on a tag lookup, and whether one of them is being looked up now.
+    Tags { left: usize, active: bool },
+}
+
+/// Per-track tag sync state, for markers in the track lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TagState {
+    Syncing,
+    Queued,
+    Failed,
+    Done,
+    NotFound,
+    /// Pending but not queued (no worker, e.g.).
+    Waiting,
+}
+
+pub enum LibraryRow {
+    Artist { name: String, count: usize },
+    Track(String),
+}
+
+/// The library explorer: every track, grouped by artist or listed by title, searchable.
+pub struct LibraryBrowser {
+    pub query: String,
+    pub editing: bool,
+    pub by_artist: bool,
+    pub rows: Vec<LibraryRow>,
+    pub selected: usize,
+}
+
 pub struct TagBrowser {
     pub tags: Vec<String>,
     pub selected: usize,
@@ -290,6 +362,19 @@ impl App {
             audio_sink: None,
             now_playing: None,
             audio_paused: false,
+            library: Library::default(),
+            track_playlists: HashMap::new(),
+            library_browser: None,
+            lastfm_api_key: None,
+            cloud_backup_dir: None,
+            backup_status: None,
+            tag_worker: None,
+            tag_queued: HashSet::new(),
+            tag_in_flight: None,
+            tag_errors: HashSet::new(),
+            tag_results_since_save: 0,
+            library_dirty: false,
+            tidal_refresh_queue: Vec::new(),
             import_fetch_rx: None,
             pending_spotify_import: None,
             tidal_search_rx: None,
@@ -301,7 +386,7 @@ impl App {
         }
     }
 
-    fn play_track(&mut self, path: &std::path::Path, index: usize) {
+    fn play_track(&mut self, path: &std::path::Path) {
         if self.audio_handle.is_none() {
             match rodio::OutputStream::try_default() {
                 Ok((stream, handle)) => {
@@ -316,27 +401,25 @@ impl App {
         }
         let Some(handle) = &self.audio_handle else { return };
 
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.message = format!("Could not open that track: {error}");
-                return;
-            }
-        };
-        let source = match rodio::Decoder::new(std::io::BufReader::new(file)) {
+        let source = match open_decoder(path) {
             Ok(source) => source,
             Err(error) => {
-                self.message = format!("Could not decode that track: {error}");
+                self.message = error;
                 return;
             }
         };
+        // Replace the old sink before creating the new one so two tracks never overlap.
+        if let Some(old) = self.audio_sink.take() {
+            old.stop();
+        }
         match rodio::Sink::try_new(handle) {
             Ok(sink) => {
                 sink.append(source);
                 self.audio_sink = Some(sink);
-                self.now_playing = Some(index);
+                self.now_playing = Some(path.to_path_buf());
                 self.audio_paused = false;
-                self.message = "▶ playing".into();
+                let name = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+                self.message = format!("▶ playing {name}");
             }
             Err(error) => self.message = format!("Could not play that track: {error}"),
         }
@@ -355,12 +438,61 @@ impl App {
     }
 
     fn stop_playback(&mut self) {
-        self.audio_sink = None;
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
         self.now_playing = None;
         self.audio_paused = false;
     }
 
-    fn save_config(&self) -> std::io::Result<()> {
+    /// Call once per frame; when a track ends inside a playlist, moves on to the next track
+    /// that has a local file, otherwise just clears the "now playing" state.
+    pub fn poll_playback(&mut self) {
+        let finished = self.audio_sink.as_ref().is_some_and(|sink| sink.empty()) && !self.audio_paused;
+        if !finished {
+            return;
+        }
+        let Some(current) = self.now_playing.clone() else {
+            self.audio_sink = None;
+            return;
+        };
+        let next = self.tracks.as_ref().and_then(|view| {
+            let position = view.tracks.iter().position(|track| track.remote_metadata.is_none() && track.path == current)?;
+            view.tracks.iter().enumerate().skip(position + 1).find(|(_, track)| track.remote_metadata.is_none()).map(|(index, track)| (index, track.path.clone()))
+        });
+        match next {
+            Some((index, path)) => {
+                if let Some(view) = &mut self.tracks {
+                    view.selected = index;
+                }
+                self.refresh_selected_track();
+                self.play_track(&path);
+            }
+            None => {
+                self.audio_sink = None;
+                self.now_playing = None;
+                self.message = "■ end of playlist".into();
+            }
+        }
+    }
+
+    /// Play/pause toggle for a specific file: pauses/resumes if it's the one loaded, otherwise
+    /// starts it.
+    fn play_or_toggle(&mut self, path: &std::path::Path) {
+        if self.now_playing.as_deref() == Some(path) && self.audio_sink.is_some() {
+            self.toggle_pause();
+        } else {
+            self.play_track(path);
+        }
+    }
+
+    /// Saves config.json, the library (if it changed) and — at most once a minute — the cloud
+    /// backup snapshot.
+    fn save_config(&mut self) -> std::io::Result<()> {
+        self.save_everything(false)
+    }
+
+    fn save_everything(&mut self, force_backup: bool) -> std::io::Result<()> {
         config::save(&config::AppConfig {
             crates: self.crates.clone(),
             spotify_client_id: self.spotify_client_id.clone(),
@@ -368,7 +500,73 @@ impl App {
             tidal_client_id: self.tidal_client_id.clone(),
             tidal_client_secret: self.tidal_client_secret.clone(),
             tidal_country_code: self.tidal_country_code.clone(),
-        })
+            lastfm_api_key: self.lastfm_api_key.clone(),
+            cloud_backup_dir: self.cloud_backup_dir.clone(),
+        })?;
+        if self.library_dirty {
+            library::save(&self.library)?;
+            self.library_dirty = false;
+        }
+        self.write_backup(force_backup);
+        Ok(())
+    }
+
+    fn write_backup(&mut self, force: bool) {
+        let Some(dir) = self.cloud_backup_dir.clone() else { return };
+        let recent = matches!(self.backup_status, Some(Ok(at)) if library::now_secs().saturating_sub(at) < BACKUP_MIN_INTERVAL_SECS);
+        if recent && !force {
+            return;
+        }
+        self.backup_status = Some(library::write_backup(&dir, &self.crates, &self.library).map(|_| library::now_secs()).map_err(|error| error.to_string()));
+    }
+
+    /// Called once the main loop exits: flush the library and the cloud backup.
+    pub fn shutdown(&mut self) {
+        self.stop_playback();
+        let _ = self.save_everything(true);
+    }
+
+    /// Merges a cloud backup into this machine: library metadata/tags for tracks we don't have
+    /// yet (or have without tags), plus hand-written tags and links for playlists with the same
+    /// crate + playlist name.
+    fn restore_from_backup(&mut self) -> Result<(usize, usize), String> {
+        let Some(dir) = self.cloud_backup_dir.clone() else { return Err("set a cloud backup folder first".into()) };
+        let backup = library::read_backup(&dir).map_err(|error| error.to_string())?;
+        let mut tracks_restored = 0;
+        for (id, track) in backup.tracks {
+            match self.library.tracks.get_mut(&id) {
+                Some(existing) => {
+                    if existing.tags.is_empty() && !track.tags.is_empty() {
+                        existing.tags = track.tags;
+                        existing.tag_status = track.tag_status;
+                        existing.tags_source = track.tags_source;
+                        existing.tags_updated_secs = track.tags_updated_secs;
+                        tracks_restored += 1;
+                    }
+                }
+                None => {
+                    self.library.tracks.insert(id, track);
+                    tracks_restored += 1;
+                }
+            }
+        }
+        let mut playlists_restored = 0;
+        for backup_crate in backup.crates {
+            let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == backup_crate.name) else { continue };
+            for backup_playlist in backup_crate.playlists {
+                let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&backup_playlist.name)) else { continue };
+                if playlist.tags.is_empty() && !backup_playlist.tags.is_empty() {
+                    playlist.tags = backup_playlist.tags;
+                    playlists_restored += 1;
+                }
+                if playlist.link.is_none() && backup_playlist.link.is_some() {
+                    playlist.link = backup_playlist.link;
+                }
+            }
+        }
+        self.library_dirty = true;
+        self.refresh_derived();
+        Ok((tracks_restored, playlists_restored))
     }
 
     fn ensure_picker(&mut self) -> &mut Picker {
@@ -384,14 +582,16 @@ impl App {
     fn refresh_selected_track(&mut self) {
         let Some(view) = &self.tracks else { return };
         let Some(track) = view.tracks.get(view.selected) else { return };
-        let metadata = if let Some(remote) = &track.remote_metadata {
-            Some(TrackMetadata {
-                title: Some(track.name.clone()),
-                artist: (!remote.artist.is_empty()).then(|| remote.artist.clone()),
-                album: (!remote.album.is_empty()).then(|| remote.album.clone()),
-                year: None,
-                genre: None,
-                duration_secs: remote.duration_secs,
+        let library_track = view.track_ids.get(view.selected).and_then(|id| self.library.tracks.get(id));
+        let metadata = if track.remote_metadata.is_some() {
+            // Not downloaded: everything we know about it lives in the library.
+            library_track.map(|entry| TrackMetadata {
+                title: Some(entry.title.clone()),
+                artist: (!entry.artist.is_empty()).then(|| entry.artist.clone()),
+                album: (!entry.album.is_empty()).then(|| entry.album.clone()),
+                year: entry.year,
+                genre: (!entry.genres.is_empty()).then(|| entry.genres.join(", ")),
+                duration_secs: entry.duration_secs,
                 cover: None,
             })
         } else {
@@ -414,31 +614,301 @@ impl App {
     pub fn load() -> Self {
         let mut app = Self::demo();
         match config::load() {
-            Ok(Some(loaded)) if !loaded.crates.is_empty() => {
-                app.spotify_client_id = loaded.spotify_client_id;
-                app.spotify_refresh_token = loaded.spotify_refresh_token;
-                app.tidal_client_id = loaded.tidal_client_id;
-                app.tidal_client_secret = loaded.tidal_client_secret;
-                app.tidal_country_code = loaded.tidal_country_code;
-                app.crates = loaded.crates;
-                app.message = "Welcome back. Your crate map is loaded.".into();
-            }
             Ok(Some(loaded)) => {
+                app.message = if loaded.crates.is_empty() { "No crates yet. Press c, then n to add one.".into() } else { "Welcome back. Your crate map is loaded.".into() };
                 app.spotify_client_id = loaded.spotify_client_id;
                 app.spotify_refresh_token = loaded.spotify_refresh_token;
                 app.tidal_client_id = loaded.tidal_client_id;
                 app.tidal_client_secret = loaded.tidal_client_secret;
                 app.tidal_country_code = loaded.tidal_country_code;
-                app.message = "No crates yet. Press c, then n to add one.".into();
+                app.lastfm_api_key = loaded.lastfm_api_key;
+                app.cloud_backup_dir = loaded.cloud_backup_dir;
+                app.crates = loaded.crates;
             }
             Ok(None) => app.message = format!("No config yet. Press c, then n to add a crate. ({})", config::display_path()),
             Err(error) => app.message = format!("Could not load config: {}. Starting with no crates.", error),
         }
+        match library::load() {
+            Ok(Some(loaded)) => app.library = loaded,
+            Ok(None) => {
+                // First run on this machine (or the library file was lost): pull the metadata
+                // and tags already gathered elsewhere from the cloud backup, if there is one.
+                if app.cloud_backup_dir.is_some() {
+                    if let Ok((tracks, _)) = app.restore_from_backup() {
+                        app.message = format!("Library restored from the cloud backup ({tracks} tracks).");
+                    }
+                }
+            }
+            Err(error) => app.message = format!("Could not read the library ({error}) — rebuilding it from disk."),
+        }
+        app.library.prune_missing_files();
+        app.tag_worker = Some(TagWorker::spawn(app.lastfm_api_key.clone()));
         app.refresh_availability();
         app.rescan_playlists();
         let _ = app.save_config();
         app.start_tidal_crate_refresh(app.selected_crate);
         app
+    }
+
+    /// Rescans one crate from disk, resolves every playlist's tracks into library ids, and
+    /// refreshes everything derived from that (playlist tags, "also in" index, tag queue).
+    fn rescan_crate(&mut self, crate_index: usize) {
+        self.rescan_crate_quiet(crate_index);
+        self.refresh_derived();
+    }
+
+    fn rescan_crate_quiet(&mut self, crate_index: usize) {
+        let Some(crate_location) = self.crates.get(crate_index) else { return };
+        let scanned = sync::scan_crate_playlists(crate_location);
+        let merged = merge_playlists(&crate_location.playlists, scanned);
+        self.crates[crate_index].playlists = merged;
+        for playlist_index in 0..self.crates[crate_index].playlists.len() {
+            let name = self.crates[crate_index].playlists[playlist_index].name.clone();
+            let (_, ids) = self.playlist_tracks(crate_index, &name);
+            let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+            for id in ids {
+                if !unique.contains(&id) {
+                    unique.push(id);
+                }
+            }
+            self.crates[crate_index].playlists[playlist_index].track_ids = unique;
+        }
+    }
+
+    fn rescan_crate_named(&mut self, crate_name: &str) {
+        if let Some(crate_index) = self.crates.iter().position(|crate_location| crate_location.name == crate_name) {
+            self.rescan_crate(crate_index);
+        }
+    }
+
+    /// A playlist's entries (local files + not-yet-downloaded manifest entries) with the
+    /// library id of each. A manifest entry whose song already has a local file in the
+    /// playlist is dropped — it's the same track, already downloaded.
+    fn playlist_tracks(&mut self, crate_index: usize, playlist_name: &str) -> (Vec<TrackFile>, Vec<String>) {
+        let Some(crate_location) = self.crates.get(crate_index) else { return (Vec::new(), Vec::new()) };
+        let link = crate_location.playlists.iter().find(|playlist| playlist.name.eq_ignore_ascii_case(playlist_name)).and_then(|playlist| playlist.link.clone());
+        let listed = sync::list_playlist_tracks(crate_location, playlist_name);
+        let resolved: Vec<(TrackFile, String)> = listed
+            .into_iter()
+            .map(|track| {
+                let id = self.library.resolve(&track, link.as_ref());
+                (track, id)
+            })
+            .collect();
+        self.library_dirty = true;
+        let local_ids: HashSet<String> = resolved.iter().filter(|(track, _)| track.remote_metadata.is_none()).map(|(_, id)| id.clone()).collect();
+        let mut seen_remote: HashSet<String> = HashSet::new();
+        resolved.into_iter().filter(|(track, id)| track.remote_metadata.is_none() || (!local_ids.contains(id) && seen_remote.insert(id.clone()))).unzip()
+    }
+
+    /// Recomputes what's derived from playlists + library: each playlist's auto tags, the
+    /// track -> playlists index, and which tracks still need a tag lookup.
+    fn refresh_derived(&mut self) {
+        self.recompute_playlist_tags();
+        self.track_playlists.clear();
+        for crate_location in &self.crates {
+            for playlist in &crate_location.playlists {
+                for id in &playlist.track_ids {
+                    self.track_playlists.entry(id.clone()).or_default().push((crate_location.name.clone(), playlist.name.clone()));
+                }
+            }
+        }
+        self.queue_pending_tags();
+        if self.library_browser.is_some() {
+            self.rebuild_library_rows();
+        }
+    }
+
+    fn recompute_playlist_tags(&mut self) {
+        for crate_location in &mut self.crates {
+            for playlist in &mut crate_location.playlists {
+                playlist.auto_tags = self.library.playlist_tags(&playlist.track_ids);
+            }
+        }
+        if let Some(view) = &mut self.tracks {
+            if let Some(playlist) = self.crates.iter().find(|crate_location| crate_location.name == view.crate_name).and_then(|crate_location| crate_location.playlists.iter().find(|playlist| playlist.name == view.playlist.name)) {
+                view.playlist.auto_tags = playlist.auto_tags.clone();
+                view.playlist.track_ids = playlist.track_ids.clone();
+            }
+        }
+    }
+
+    /// Queues every library track that hasn't had a tag lookup yet — the selected crate's
+    /// tracks first, then the other crates', then tracks no playlist references anymore.
+    fn queue_pending_tags(&mut self) {
+        let Some(worker) = &self.tag_worker else { return };
+        let crate_count = self.crates.len();
+        let ordered = (0..crate_count)
+            .map(|offset| (self.selected_crate + offset) % crate_count.max(1))
+            .filter_map(|index| self.crates.get(index))
+            .flat_map(|crate_location| crate_location.playlists.iter().flat_map(|playlist| playlist.track_ids.iter()))
+            .chain(self.library.tracks.keys());
+        for id in ordered {
+            let Some(track) = self.library.tracks.get(id) else { continue };
+            if track.tag_status != TagStatus::Pending || self.tag_queued.contains(id) || self.tag_errors.contains(id) {
+                continue;
+            }
+            worker.push_back(TagJob { id: id.clone(), artist: track.artist.clone(), title: track.title.clone() });
+            self.tag_queued.insert(id.clone());
+        }
+    }
+
+    /// Re-looks-up one track's tags now, ahead of everything else queued.
+    fn refetch_tags(&mut self, id: &str) {
+        let Some(worker) = &self.tag_worker else { return };
+        let Some(track) = self.library.tracks.get_mut(id) else { return };
+        track.tag_status = TagStatus::Pending;
+        self.tag_errors.remove(id);
+        worker.push_front(TagJob { id: id.to_string(), artist: track.artist.clone(), title: track.title.clone() });
+        self.tag_queued.insert(id.to_string());
+        self.message = format!("Looking up tags for \"{}\"…", track.title);
+    }
+
+    /// Call once per frame; non-blocking. Applies finished tag lookups.
+    pub fn poll_tags(&mut self) {
+        let Some(worker) = &self.tag_worker else { return };
+        let mut updates = Vec::new();
+        loop {
+            match worker.updates.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.tag_worker = None;
+                    self.tag_in_flight = None;
+                    break;
+                }
+            }
+        }
+        let mut finished = 0;
+        for update in updates {
+            match update {
+                TagUpdate::Started(id) => self.tag_in_flight = Some(id),
+                TagUpdate::Finished(id, result) => {
+                    self.tag_queued.remove(&id);
+                    if self.tag_in_flight.as_deref() == Some(id.as_str()) {
+                        self.tag_in_flight = None;
+                    }
+                    let Some(track) = self.library.tracks.get_mut(&id) else { continue };
+                    match result {
+                        Ok(Some((tags, source))) => {
+                            track.tags = tags;
+                            track.tag_status = TagStatus::Done;
+                            track.tags_source = Some(source.to_string());
+                            track.tags_updated_secs = Some(library::now_secs());
+                        }
+                        Ok(None) => {
+                            track.tag_status = TagStatus::NotFound;
+                            track.tags_updated_secs = Some(library::now_secs());
+                        }
+                        Err(_) => {
+                            self.tag_errors.insert(id);
+                        }
+                    }
+                    finished += 1;
+                }
+            }
+        }
+        if finished == 0 {
+            return;
+        }
+        self.library_dirty = true;
+        self.tag_results_since_save += finished;
+        self.recompute_playlist_tags();
+        if self.tag_results_since_save >= TAG_SAVE_EVERY || self.tag_queued.is_empty() {
+            self.tag_results_since_save = 0;
+            let _ = self.save_config();
+        }
+        if self.tracks.is_some() {
+            self.refresh_selected_track();
+        }
+    }
+
+    pub fn tag_queue_len(&self) -> usize {
+        self.tag_queued.len()
+    }
+
+    pub fn tag_state(&self, id: &str) -> TagState {
+        if self.tag_in_flight.as_deref() == Some(id) {
+            return TagState::Syncing;
+        }
+        if self.tag_errors.contains(id) {
+            return TagState::Failed;
+        }
+        if self.tag_queued.contains(id) {
+            return TagState::Queued;
+        }
+        match self.library.tracks.get(id).map(|track| track.tag_status) {
+            Some(TagStatus::Done) => TagState::Done,
+            Some(TagStatus::NotFound) => TagState::NotFound,
+            _ => TagState::Waiting,
+        }
+    }
+
+    /// Every (crate, playlist) holding this track.
+    pub fn playlists_for(&self, id: &str) -> &[(String, String)] {
+        self.track_playlists.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// What's in progress for this playlist right now (Tidal check, import, download, tags).
+    pub fn playlist_activity(&self, crate_index: usize, playlist_index: usize) -> Vec<Activity> {
+        let mut out = Vec::new();
+        let Some(crate_location) = self.crates.get(crate_index) else { return out };
+        let Some(playlist) = crate_location.playlists.get(playlist_index) else { return out };
+        let key = (crate_location.name.clone(), playlist.name.clone());
+        if let Some(position) = self.tidal_refresh_queue.iter().position(|queued| *queued == key) {
+            out.push(Activity::Tidal(position == 0));
+        }
+        if self.pending_spotify_import.as_ref().is_some_and(|pending| !pending.is_new && pending.crate_index == crate_index && pending.playlist_index == playlist_index) {
+            out.push(Activity::Importing);
+        }
+        let downloading = self.soundcloud_download_rx.is_some() || self.spotify_tidal_download_rx.is_some() || self.tidal_playlist_download_rx.is_some();
+        if downloading && self.tracks.as_ref().is_some_and(|view| view.crate_name == key.0 && view.playlist.name == key.1) {
+            out.push(Activity::Downloading);
+        }
+        let left = playlist.track_ids.iter().filter(|id| self.tag_queued.contains(*id)).count();
+        if left > 0 {
+            let active = self.tag_in_flight.as_ref().is_some_and(|id| playlist.track_ids.contains(id));
+            out.push(Activity::Tags { left, active });
+        }
+        out
+    }
+
+    pub fn is_importing_new(&self) -> bool {
+        self.pending_spotify_import.as_ref().is_some_and(|pending| pending.is_new)
+    }
+
+    pub fn is_downloading(&self) -> bool {
+        self.soundcloud_download_rx.is_some() || self.spotify_tidal_download_rx.is_some() || self.tidal_playlist_download_rx.is_some()
+    }
+
+    /// Opens a playlist's track view (every entry resolved to its library track).
+    fn open_playlist(&mut self, crate_index: usize, playlist_name: &str) {
+        let Some(crate_location) = self.crates.get(crate_index) else { return };
+        let crate_name = crate_location.name.clone();
+        let Some(playlist) = crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).cloned() else {
+            self.message = "That playlist isn't there anymore — press r to rescan.".into();
+            return;
+        };
+        let (tracks, track_ids) = self.playlist_tracks(crate_index, playlist_name);
+        let tidal_status = vec![None; tracks.len()];
+        self.tracks = Some(TrackView { crate_name, playlist, tracks, track_ids, selected: 0, metadata: None, cover: None, tidal_status });
+        self.refresh_selected_track();
+    }
+
+    /// Re-reads the open playlist (after a rescan/download) without leaving the view.
+    fn reload_open_playlist(&mut self, reset_selection: bool) {
+        let Some((crate_name, playlist_name)) = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone())) else { return };
+        let Some(crate_index) = self.crates.iter().position(|crate_location| crate_location.name == crate_name) else { return };
+        let Some(playlist) = self.crates[crate_index].playlists.iter().find(|playlist| playlist.name == playlist_name).cloned() else { return };
+        let (tracks, track_ids) = self.playlist_tracks(crate_index, &playlist_name);
+        if let Some(view) = &mut self.tracks {
+            view.tidal_status = vec![None; tracks.len()];
+            view.selected = if reset_selection { 0 } else { view.selected.min(tracks.len().saturating_sub(1)) };
+            view.playlist = playlist;
+            view.tracks = tracks;
+            view.track_ids = track_ids;
+        }
+        self.refresh_selected_track();
     }
 
     fn current_playlists(&self) -> &[Playlist] {
@@ -538,6 +1008,7 @@ impl App {
             return;
         }
         match self.screen {
+            Screen::Library => self.handle_library_key(key),
             Screen::Config => self.handle_config_key(key),
             Screen::Import => self.handle_import_key(key),
             Screen::Settings => self.handle_settings_key(key),
@@ -571,7 +1042,7 @@ impl App {
                 self.refresh_availability();
                 self.rescan_playlists();
                 self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
-                let missing: Vec<&str> = self.crates.iter().filter(|crate_location| !crate_location.available).map(|crate_location| crate_location.name.as_str()).collect();
+                let missing: Vec<String> = self.crates.iter().filter(|crate_location| !crate_location.available).map(|crate_location| crate_location.name.clone()).collect();
                 let save_note = if self.save_config().is_ok() { "" } else { " (could not save)" };
                 self.message = if missing.is_empty() {
                     format!("Playlists rescanned from disk.{save_note}")
@@ -608,10 +1079,8 @@ impl App {
                     self.message = "No playlist selected.".into();
                     return;
                 };
-                let tracks = sync::list_playlist_tracks(crate_location, &playlist.name);
-                let tidal_status = vec![None; tracks.len()];
-                self.tracks = Some(TrackView { crate_name: crate_location.name.clone(), playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None, tidal_status });
-                self.refresh_selected_track();
+                let name = playlist.name.clone();
+                self.open_playlist(self.selected_crate, &name);
             }
             KeyCode::Char('T') => {
                 let Some(playlist) = self.current_playlists().get(self.selected_playlist) else {
@@ -623,8 +1092,9 @@ impl App {
                 self.editing_tags = true;
                 self.message = "Editing tags (comma separated). Enter to save, Esc to cancel.".into();
             }
+            KeyCode::Char('b') | KeyCode::Char('/') => self.open_library(key == KeyCode::Char('/')),
             KeyCode::Char('t') => {
-                let mut tags: Vec<String> = self.crates.iter().flat_map(|crate_location| crate_location.playlists.iter()).flat_map(|playlist| playlist.tags.iter().cloned()).collect();
+                let mut tags: Vec<String> = self.crates.iter().flat_map(|crate_location| crate_location.playlists.iter()).flat_map(|playlist| playlist.tags.iter().chain(playlist.auto_tags.iter()).cloned()).collect();
                 tags.sort_unstable();
                 tags.dedup();
                 if tags.is_empty() {
@@ -672,9 +1142,21 @@ impl App {
                             self.tidal_client_secret = value;
                             "Tidal Client Secret"
                         }
-                        _ => {
+                        3 => {
                             self.tidal_country_code = value.map(|country| country.to_uppercase());
                             "Tidal Country Code"
+                        }
+                        4 => {
+                            self.lastfm_api_key = value;
+                            if let Some(worker) = &self.tag_worker {
+                                worker.set_lastfm_key(self.lastfm_api_key.clone());
+                            }
+                            "Last.fm API Key"
+                        }
+                        _ => {
+                            self.cloud_backup_dir = value;
+                            self.backup_status = None;
+                            "Cloud backup folder"
                         }
                     };
                     self.editing_settings = false;
@@ -717,8 +1199,29 @@ impl App {
             KeyCode::Esc | KeyCode::Char('s') => {
                 self.screen = Screen::Dashboard;
             }
-            KeyCode::Up | KeyCode::Char('k') => self.settings_field = self.settings_field.checked_sub(1).unwrap_or(3),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.settings_field = (self.settings_field + 1) % 4,
+            KeyCode::Up | KeyCode::Char('k') => self.settings_field = self.settings_field.checked_sub(1).unwrap_or(SETTINGS_FIELDS - 1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.settings_field = (self.settings_field + 1) % SETTINGS_FIELDS,
+            KeyCode::Char('b') => {
+                if self.cloud_backup_dir.is_none() {
+                    self.message = "Set a cloud backup folder first (select it, then Enter).".into();
+                    return;
+                }
+                self.write_backup(true);
+                self.message = match &self.backup_status {
+                    Some(Ok(_)) => format!("Backed up the library + playlists to {}.", self.cloud_backup_dir.clone().unwrap_or_default()),
+                    Some(Err(error)) => format!("Backup failed: {error}"),
+                    None => String::new(),
+                };
+            }
+            KeyCode::Char('B') => {
+                self.message = match self.restore_from_backup() {
+                    Ok((tracks, playlists)) => {
+                        let _ = self.save_config();
+                        format!("Restored {tracks} track(s) and tags for {playlists} playlist(s) from the backup.")
+                    }
+                    Err(error) => format!("Could not restore: {error}"),
+                };
+            }
             KeyCode::Enter | KeyCode::Char('e') => {
                 self.settings_buffer = self.settings_field_value(self.settings_field).unwrap_or_default();
                 self.settings_cursor = self.settings_buffer.chars().count();
@@ -741,7 +1244,9 @@ impl App {
             0 => self.spotify_client_id.clone(),
             1 => self.tidal_client_id.clone(),
             2 => self.tidal_client_secret.clone(),
-            _ => self.tidal_country_code.clone(),
+            3 => self.tidal_country_code.clone(),
+            4 => self.lastfm_api_key.clone(),
+            _ => self.cloud_backup_dir.clone(),
         }
     }
 
@@ -972,9 +1477,8 @@ impl App {
                 self.screen = Screen::Dashboard;
                 return;
             }
+            self.rescan_crate(crate_index);
             if let Some(crate_location) = self.crates.get_mut(crate_index) {
-                let scanned = sync::scan_crate_playlists(crate_location);
-                crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
                 if let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&external_name)) {
                     playlist.link = Some(PlaylistLink { service, external_name: external_name.clone(), source_url: None });
                 }
@@ -1126,12 +1630,16 @@ impl App {
         }
 
         let track_count = result.tracks.len();
+        // Link first so the rescan tags manifest entries with the right service's ids.
+        self.rescan_crate_quiet(pending.crate_index);
         if let Some(crate_location) = self.crates.get_mut(pending.crate_index) {
-            let scanned = sync::scan_crate_playlists(crate_location);
-            crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
             if let Some(playlist) = crate_location.playlists.iter_mut().find(|playlist| playlist.name.eq_ignore_ascii_case(&folder_name)) {
                 playlist.link = Some(PlaylistLink { service: pending.service, external_name: result.name.clone(), source_url: Some(pending.link.clone()) });
             }
+        }
+        self.rescan_crate(pending.crate_index);
+        if self.tracks.as_ref().is_some_and(|view| view.playlist.name.eq_ignore_ascii_case(&folder_name)) {
+            self.reload_open_playlist(false);
         }
 
         self.message = if pending.service == ImportService::Tidal {
@@ -1169,17 +1677,24 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('p') => {
                 let Some(track) = view.tracks.get(view.selected) else { return };
-                let selected = view.selected;
                 if track.remote_metadata.is_some() {
-                    self.message = "This track is metadata only (no local audio file) — nothing to play.".into();
-                } else if self.now_playing == Some(selected) {
-                    self.toggle_pause();
+                    // Same song may already be downloaded in another playlist.
+                    let other_copy = view.track_ids.get(view.selected).and_then(|id| self.library.files_for(id).into_iter().next());
+                    match other_copy {
+                        Some(path) => self.play_or_toggle(&path),
+                        None => self.message = "This track is metadata only (no local audio file anywhere) — nothing to play.".into(),
+                    }
                 } else {
                     let path = track.path.clone();
-                    self.play_track(&path, selected);
+                    self.play_or_toggle(&path);
                 }
             }
             KeyCode::Char('x') => self.stop_playback(),
+            KeyCode::Char('g') => {
+                if let Some(id) = view.track_ids.get(view.selected).cloned() {
+                    self.refetch_tags(&id);
+                }
+            }
             KeyCode::Char('F') => self.start_tidal_search(),
             KeyCode::Char('D') => self.start_download(),
             KeyCode::Char('R') => self.refresh_tidal_link(),
@@ -1251,6 +1766,7 @@ impl App {
         }
 
         self.message = format!("Checking Tidal sync status… ({} playlist{})", targets.len(), if targets.len() == 1 { "" } else { "s" });
+        self.tidal_refresh_queue = targets.iter().map(|(playlist_name, _)| (crate_name.clone(), playlist_name.clone())).collect();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for (playlist_name, source_url) in targets {
@@ -1265,11 +1781,16 @@ impl App {
     pub fn poll_tidal_crate_refresh(&mut self) {
         let Some(rx) = &self.tidal_crate_refresh_rx else { return };
         match rx.try_recv() {
-            Ok((crate_name, playlist_name, Ok(fetched))) => self.apply_tidal_refresh(&crate_name, &playlist_name, fetched),
-            Ok((_, _, Err(_))) => {}
+            Ok((crate_name, playlist_name, result)) => {
+                self.tidal_refresh_queue.retain(|queued| !(queued.0 == crate_name && queued.1 == playlist_name));
+                if let Ok(fetched) = result {
+                    self.apply_tidal_refresh(&crate_name, &playlist_name, fetched);
+                }
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.tidal_crate_refresh_rx = None;
+                self.tidal_refresh_queue.clear();
                 if self.message.starts_with("Checking Tidal sync status") {
                     self.message = "Tidal sync status updated.".into();
                 }
@@ -1293,26 +1814,11 @@ impl App {
             let _ = std::fs::write(folder.join("tidal-tracks.json"), contents);
         }
 
-        if let Some(crate_location) = self.crates.get_mut(crate_index) {
-            let scanned = sync::scan_crate_playlists(crate_location);
-            crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
-        }
+        self.rescan_crate(crate_index);
         let _ = self.save_config();
 
-        if let Some(view) = &self.tracks {
-            if view.crate_name == crate_name && view.playlist.name == playlist_name {
-                let refreshed = self.crates.get(crate_index).and_then(|crate_location| {
-                    let tracks = sync::list_playlist_tracks(crate_location, playlist_name);
-                    crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
-                });
-                if let Some((playlist, tracks)) = refreshed {
-                    if let Some(view) = &mut self.tracks {
-                        view.playlist = playlist;
-                        view.tracks = tracks;
-                        view.tidal_status = vec![None; view.tracks.len()];
-                    }
-                }
-            }
+        if self.tracks.as_ref().is_some_and(|view| view.crate_name == crate_name && view.playlist.name == playlist_name) {
+            self.reload_open_playlist(false);
         }
     }
 
@@ -1446,30 +1952,9 @@ impl App {
         match result {
             Ok(()) => {
                 self.message = "Downloaded playlist via tidal-dl-ng.".into();
-                let names = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone()));
-                if let Some((crate_name, playlist_name)) = names {
-                    if let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == crate_name) {
-                        let scanned = sync::scan_crate_playlists(crate_location);
-                        crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
-                    }
-                    let _ = self.save_config();
-
-                    let refreshed = self.crates.iter().find(|crate_location| crate_location.name == crate_name).and_then(|crate_location| {
-                        let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
-                        crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
-                    });
-
-                    if let Some((playlist, tracks)) = refreshed {
-                        self.message = format!("Downloaded via tidal-dl-ng — now {}/{} tracks synced.", playlist.synced, playlist.track_count);
-                        let tidal_status = vec![None; tracks.len()];
-                        if let Some(view) = &mut self.tracks {
-                            view.playlist = playlist;
-                            view.tracks = tracks;
-                            view.tidal_status = tidal_status;
-                            view.selected = 0;
-                        }
-                    }
-                    self.refresh_selected_track();
+                self.rescan_current_playlist();
+                if let Some(view) = &self.tracks {
+                    self.message = format!("Downloaded via tidal-dl-ng — now {}/{} tracks synced.", view.playlist.synced, view.playlist.track_count);
                 }
                 // Close the log automatically once the download finishes cleanly — nothing left
                 // to watch. Left open on failure so the error/what-happened trail stays visible
@@ -1519,30 +2004,7 @@ impl App {
 
                 // Rescan so the crate's playlist reflects the newly downloaded files, and
                 // refresh the open track view so the ☁ metadata-only markers go away.
-                let names = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone()));
-                if let Some((crate_name, playlist_name)) = names {
-                    if let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == crate_name) {
-                        let scanned = sync::scan_crate_playlists(crate_location);
-                        crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
-                    }
-                    let _ = self.save_config();
-
-                    let refreshed = self.crates.iter().find(|crate_location| crate_location.name == crate_name).and_then(|crate_location| {
-                        let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
-                        crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
-                    });
-
-                    if let Some((playlist, tracks)) = refreshed {
-                        let tidal_status = vec![None; tracks.len()];
-                        if let Some(view) = &mut self.tracks {
-                            view.playlist = playlist;
-                            view.tracks = tracks;
-                            view.tidal_status = tidal_status;
-                            view.selected = 0;
-                        }
-                    }
-                    self.refresh_selected_track();
-                }
+                self.rescan_current_playlist();
             }
             Ok(Err(error)) => {
                 self.soundcloud_download_rx = None;
@@ -1725,30 +2187,10 @@ impl App {
     /// Re-scans the crate's paths and re-reads the currently open playlist's track list, so
     /// synced counts and the track view reflect whatever's actually on disk right now.
     fn rescan_current_playlist(&mut self) {
-        let names = self.tracks.as_ref().map(|view| (view.crate_name.clone(), view.playlist.name.clone()));
-        let Some((crate_name, playlist_name)) = names else { return };
-
-        if let Some(crate_location) = self.crates.iter_mut().find(|crate_location| crate_location.name == crate_name) {
-            let scanned = sync::scan_crate_playlists(crate_location);
-            crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
-        }
+        let Some(crate_name) = self.tracks.as_ref().map(|view| view.crate_name.clone()) else { return };
+        self.rescan_crate_named(&crate_name);
         let _ = self.save_config();
-
-        let refreshed = self.crates.iter().find(|crate_location| crate_location.name == crate_name).and_then(|crate_location| {
-            let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
-            crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name).map(|playlist| (playlist.clone(), tracks))
-        });
-
-        if let Some((playlist, tracks)) = refreshed {
-            let tidal_status = vec![None; tracks.len()];
-            if let Some(view) = &mut self.tracks {
-                view.playlist = playlist;
-                view.tracks = tracks;
-                view.tidal_status = tidal_status;
-                view.selected = 0;
-            }
-        }
-        self.refresh_selected_track();
+        self.reload_open_playlist(true);
     }
 
     /// Secret: checks every track in the currently open playlist against Tidal's catalog
@@ -1878,7 +2320,7 @@ impl App {
                         .crates
                         .iter()
                         .flat_map(|crate_location| crate_location.playlists.iter().map(move |playlist| (crate_location.name.clone(), playlist)))
-                        .filter(|(_, playlist)| playlist.tags.iter().any(|t| t == &tag))
+                        .filter(|(_, playlist)| playlist.tags.iter().chain(playlist.auto_tags.iter()).any(|t| t == &tag))
                         .map(|(crate_name, playlist)| (crate_name, playlist.name.clone()))
                         .collect();
                     browser.filter = Some(tag);
@@ -1893,13 +2335,9 @@ impl App {
     fn open_selected_match(&mut self) {
         let Some(browser) = &self.tag_browser else { return };
         let Some((crate_name, playlist_name)) = browser.matches.get(browser.match_selected).cloned() else { return };
-        let Some(crate_location) = self.crates.iter().find(|crate_location| crate_location.name == crate_name) else { return };
-        let Some(playlist) = crate_location.playlists.iter().find(|playlist| playlist.name == playlist_name) else { return };
-        let tracks = sync::list_playlist_tracks(crate_location, &playlist_name);
-        let tidal_status = vec![None; tracks.len()];
-        self.tracks = Some(TrackView { crate_name, playlist: playlist.clone(), tracks, selected: 0, metadata: None, cover: None, tidal_status });
+        let Some(crate_index) = self.crates.iter().position(|crate_location| crate_location.name == crate_name) else { return };
         self.tag_browser = None;
-        self.refresh_selected_track();
+        self.open_playlist(crate_index, &playlist_name);
     }
 
     fn handle_tag_edit_key(&mut self, key: KeyCode) {
@@ -2090,10 +2528,7 @@ impl App {
         }
         self.refresh_availability();
         if path_changed {
-            if let Some(crate_location) = self.crates.get_mut(self.selected_crate) {
-                let scanned = sync::scan_crate_playlists(crate_location);
-                crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
-            }
+            self.rescan_crate(self.selected_crate);
             self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
         }
         self.editing_config = false;
@@ -2105,6 +2540,154 @@ impl App {
         };
     }
 
+    fn open_library(&mut self, start_searching: bool) {
+        if self.library.tracks.is_empty() {
+            self.message = "The library is empty — add a crate with playlists first.".into();
+            return;
+        }
+        self.library_browser = Some(LibraryBrowser { query: String::new(), editing: start_searching, by_artist: true, rows: Vec::new(), selected: 0 });
+        self.rebuild_library_rows();
+        self.screen = Screen::Library;
+        self.message = format!("{} tracks in the library.", self.library.tracks.len());
+    }
+
+    /// Rebuilds the explorer's rows from the library + search query, keeping the selection on
+    /// the same track when it's still listed.
+    fn rebuild_library_rows(&mut self) {
+        let Some(browser) = &self.library_browser else { return };
+        let previous = match browser.rows.get(browser.selected) {
+            Some(LibraryRow::Track(id)) => Some(id.clone()),
+            _ => None,
+        };
+        let terms: Vec<String> = browser.query.to_lowercase().split_whitespace().map(str::to_string).collect();
+        let matches = |track: &LibraryTrack| {
+            let haystack = format!("{} {} {} {}", track.artist, track.title, track.album, track.all_tags().join(" ")).to_lowercase();
+            terms.iter().all(|term| haystack.contains(term))
+        };
+        let mut found: Vec<&LibraryTrack> = self.library.tracks.values().filter(|track| matches(track)).collect();
+        let mut rows = Vec::new();
+        if browser.by_artist {
+            let artist_key = |track: &LibraryTrack| if track.artist.is_empty() { "~".to_string() } else { track.artist.to_lowercase() };
+            found.sort_by(|a, b| artist_key(a).cmp(&artist_key(b)).then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+            let mut index = 0;
+            while index < found.len() {
+                let key = artist_key(found[index]);
+                let group_end = found[index..].iter().position(|track| artist_key(track) != key).map_or(found.len(), |offset| index + offset);
+                let name = if found[index].artist.is_empty() { "(unknown artist)".to_string() } else { found[index].artist.clone() };
+                rows.push(LibraryRow::Artist { name, count: group_end - index });
+                rows.extend(found[index..group_end].iter().map(|track| LibraryRow::Track(track.id.clone())));
+                index = group_end;
+            }
+        } else {
+            found.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then_with(|| a.artist.to_lowercase().cmp(&b.artist.to_lowercase())));
+            rows.extend(found.iter().map(|track| LibraryRow::Track(track.id.clone())));
+        }
+        let selected = previous
+            .and_then(|id| rows.iter().position(|row| matches!(row, LibraryRow::Track(row_id) if *row_id == id)))
+            .or_else(|| rows.iter().position(|row| matches!(row, LibraryRow::Track(_))))
+            .unwrap_or(0);
+        if let Some(browser) = &mut self.library_browser {
+            browser.rows = rows;
+            browser.selected = selected;
+        }
+    }
+
+    pub fn selected_library_track(&self) -> Option<&LibraryTrack> {
+        let browser = self.library_browser.as_ref()?;
+        match browser.rows.get(browser.selected)? {
+            LibraryRow::Track(id) => self.library.tracks.get(id),
+            LibraryRow::Artist { .. } => None,
+        }
+    }
+
+    fn handle_library_key(&mut self, key: KeyCode) {
+        let Some(browser) = &mut self.library_browser else {
+            self.screen = Screen::Dashboard;
+            return;
+        };
+        if browser.editing {
+            match key {
+                KeyCode::Enter | KeyCode::Down => browser.editing = false,
+                KeyCode::Esc => {
+                    browser.editing = false;
+                    browser.query.clear();
+                    self.rebuild_library_rows();
+                }
+                KeyCode::Backspace => {
+                    browser.query.pop();
+                    self.rebuild_library_rows();
+                }
+                KeyCode::Char(character) => {
+                    browser.query.push(character);
+                    self.rebuild_library_rows();
+                }
+                _ => {}
+            }
+            return;
+        }
+        let row_count = browser.rows.len();
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.stop_playback();
+                self.library_browser = None;
+                self.screen = Screen::Dashboard;
+                self.message = "Back at the crate desk.".into();
+            }
+            KeyCode::Char('/') => browser.editing = true,
+            KeyCode::Tab => {
+                browser.by_artist = !browser.by_artist;
+                self.rebuild_library_rows();
+            }
+            KeyCode::Down | KeyCode::Char('j') if row_count > 0 => browser.selected = (browser.selected + 1) % row_count,
+            KeyCode::Up | KeyCode::Char('k') if row_count > 0 => browser.selected = browser.selected.checked_sub(1).unwrap_or(row_count - 1),
+            KeyCode::PageDown if row_count > 0 => browser.selected = (browser.selected + 15).min(row_count - 1),
+            KeyCode::PageUp => browser.selected = browser.selected.saturating_sub(15),
+            // Jump between artists.
+            KeyCode::Char('J') | KeyCode::Right => {
+                if let Some(offset) = browser.rows.iter().skip(browser.selected + 1).position(|row| matches!(row, LibraryRow::Artist { .. })) {
+                    browser.selected += offset + 1;
+                }
+            }
+            KeyCode::Char('K') | KeyCode::Left => {
+                if let Some(position) = browser.rows[..browser.selected].iter().rposition(|row| matches!(row, LibraryRow::Artist { .. })) {
+                    browser.selected = position;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('p') => {
+                let Some(track) = self.selected_library_track() else { return };
+                let title = track.title.clone();
+                match self.library.files_for(&track.id).into_iter().next() {
+                    Some(path) => self.play_or_toggle(&path),
+                    None => self.message = format!("\"{title}\" has no downloaded file yet — nothing to play."),
+                }
+            }
+            KeyCode::Char('x') => self.stop_playback(),
+            KeyCode::Char('g') => {
+                if let Some(id) = self.selected_library_track().map(|track| track.id.clone()) {
+                    self.refetch_tags(&id);
+                }
+            }
+            KeyCode::Char('o') => {
+                let Some(id) = self.selected_library_track().map(|track| track.id.clone()) else { return };
+                let Some((crate_name, playlist_name)) = self.playlists_for(&id).first().cloned() else {
+                    self.message = "This track isn't in any playlist.".into();
+                    return;
+                };
+                let Some(crate_index) = self.crates.iter().position(|crate_location| crate_location.name == crate_name) else { return };
+                self.stop_playback();
+                self.open_playlist(crate_index, &playlist_name);
+                if let Some(view) = &mut self.tracks {
+                    if let Some(position) = view.track_ids.iter().position(|track_id| *track_id == id) {
+                        view.selected = position;
+                    }
+                }
+                self.refresh_selected_track();
+            }
+            _ => {}
+        }
+    }
+
     fn refresh_availability(&mut self) {
         for crate_location in &mut self.crates {
             crate_location.available = crate_location.locations.iter().all(|location| std::path::Path::new(&location.path).exists());
@@ -2112,10 +2695,10 @@ impl App {
     }
 
     fn rescan_playlists(&mut self) {
-        for crate_location in &mut self.crates {
-            let scanned = sync::scan_crate_playlists(crate_location);
-            crate_location.playlists = merge_playlists(&crate_location.playlists, scanned);
+        for crate_index in 0..self.crates.len() {
+            self.rescan_crate_quiet(crate_index);
         }
+        self.refresh_derived();
     }
 }
 
@@ -2128,10 +2711,23 @@ fn merge_playlists(existing: &[Playlist], scanned: Vec<Playlist>) -> Vec<Playlis
             if let Some(previous) = existing.iter().find(|previous| previous.name.eq_ignore_ascii_case(&playlist.name)) {
                 playlist.tags = previous.tags.clone();
                 playlist.link = previous.link.clone();
+                playlist.auto_tags = previous.auto_tags.clone();
             }
             playlist
         })
         .collect()
+}
+
+/// Opens an audio file for playback via symphonia (every common format, M4A included); falls
+/// back to rodio's own decoders for anything symphonia can't read.
+fn open_decoder(path: &std::path::Path) -> Result<Box<dyn rodio::Source<Item = f32> + Send>, String> {
+    match player::SymphoniaSource::open(path) {
+        Ok(source) => Ok(Box::new(source)),
+        Err(error) => {
+            let file = std::fs::File::open(path).map_err(|_| error.clone())?;
+            rodio::Decoder::new(std::io::BufReader::new(file)).map(|decoder| Box::new(rodio::Source::convert_samples::<f32>(decoder)) as Box<dyn rodio::Source<Item = f32> + Send>).map_err(|_| error)
+        }
+    }
 }
 
 fn wrap_index(current: usize, delta: i32, len: usize) -> usize {
@@ -2149,7 +2745,36 @@ fn char_byte_index(text: &str, char_index: usize) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Dashboard,
+    Library,
     Config,
     Import,
     Settings,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decodes every sample file in $CRATE_RAT_AUDIO_SAMPLES (skipped when unset — needs real
+    /// audio files, e.g. made with ffmpeg).
+    #[test]
+    fn decodes_common_formats() {
+        let Ok(dir) = std::env::var("CRATE_RAT_AUDIO_SAMPLES") else { return };
+        let mut failures = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("samples dir").flatten() {
+            let path = entry.path();
+            match open_decoder(&path) {
+                Ok(decoder) => {
+                    // Samples are 2 s of audio: expect at least 1 s worth decoded end to end.
+                    let one_second = decoder.sample_rate() as usize * decoder.channels() as usize;
+                    let decoded = decoder.count();
+                    if decoded < one_second {
+                        failures.push(format!("{}: only {decoded} samples decoded", path.display()));
+                    }
+                }
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 }

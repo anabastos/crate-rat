@@ -2,11 +2,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState},
+    widgets::{Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState},
     Frame,
 };
 
-use crate::app::{App, Screen};
+use crate::app::{Activity, App, LibraryRow, Screen, TagState};
 
 const INK: Color = Color::Rgb(245, 255, 255);
 const CYAN: Color = Color::Rgb(0, 245, 255);
@@ -31,12 +31,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     }
     match app.screen {
+        Screen::Library => draw_library(frame, app, area),
         Screen::Config => draw_config(frame, app, area),
         Screen::Import => draw_import(frame, app, area),
         Screen::Settings => draw_settings(frame, app, area),
         Screen::Dashboard => {
             let vertical = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(5), Constraint::Min(8), Constraint::Length(2), Constraint::Length(2)]).split(area);
-            draw_header(frame, vertical[0]);
+            draw_header(frame, app, vertical[0]);
             let body = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(38), Constraint::Percentage(62)]).split(vertical[1]);
             draw_crates(frame, app, body[0]);
             draw_playlists(frame, app, body[1]);
@@ -54,6 +55,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 Span::styled(" new crate   ", Style::default().fg(CYAN)),
                 pill("Enter", PANEL, INK),
                 Span::styled(" view tracks   ", Style::default().fg(CYAN)),
+                pill("b", PANEL, INK),
+                Span::styled(" library   ", Style::default().fg(CYAN)),
                 pill("i", PANEL, INK),
                 Span::styled(" import   ", Style::default().fg(CYAN)),
                 pill("t", PANEL, INK),
@@ -142,11 +145,12 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Length(6), Constraint::Length(1), Constraint::Min(6), Constraint::Length(2)])
         .split(area);
-    draw_header(frame, vertical[0]);
+    draw_header(frame, app, vertical[0]);
 
     let playlist = &view.playlist;
     let status_color = if playlist.link.is_some() && playlist.track_count == 0 { PINK } else if playlist.synced == playlist.track_count { LIME } else { PINK };
-    let tags_line = if playlist.tags.is_empty() { "—".to_string() } else { playlist.tags.join(", ") };
+    let mut tag_spans = vec![Span::styled("tags: ", Style::default().fg(YELLOW))];
+    tag_spans.extend(tag_spans_for(&playlist.tags, &playlist.auto_tags));
     let link_line = playlist.link.as_ref().map_or("—".to_string(), |link| format!("{} · \"{}\"", link.service.label(), link.external_name));
 
     let details = vec![
@@ -159,7 +163,7 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
             Span::styled("status: ", Style::default().fg(YELLOW)),
             Span::styled(format!("{} ({}/{} tracks)", playlist.status(), playlist.synced, playlist.track_count), Style::default().fg(status_color)),
         ]),
-        Line::from(vec![Span::styled("tags: ", Style::default().fg(YELLOW)), Span::styled(tags_line, Style::default().fg(INK))]),
+        Line::from(tag_spans),
         Line::from(vec![Span::styled("linked service: ", Style::default().fg(YELLOW)), Span::styled(link_line, Style::default().fg(INK))]),
     ];
     frame.render_widget(Paragraph::new(details).block(panel("♡ PLAYLIST DETAILS ♡")), vertical[1]);
@@ -173,11 +177,16 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
         let items: Vec<ListItem> = view.tracks.iter().enumerate().map(|(index, track)| {
             let selected = index == view.selected;
             let prefix = if selected { "› " } else { "  " };
-            let playing_marker = if app.now_playing == Some(index) {
+            let track_id = view.track_ids.get(index).map(String::as_str).unwrap_or("");
+            let is_playing = app.now_playing.as_ref().is_some_and(|path| {
+                if track.remote_metadata.is_none() { *path == track.path } else { app.library.files.get(&path.to_string_lossy().to_string()).is_some_and(|entry| entry.track_id == track_id) }
+            });
+            let playing_marker = if is_playing {
                 if app.audio_paused { "⏸ " } else { "▶ " }
             } else {
                 ""
             };
+            let in_playlists = app.playlists_for(track_id).len();
             let name_color = if track.remote_metadata.is_some() { BLUE } else if selected { INK } else { CYAN };
             let tidal_marker = match view.tidal_status.get(index).copied().flatten() {
                 Some(true) => Span::styled("  ✓ tidal", Style::default().fg(LIME)),
@@ -185,16 +194,18 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
                 None => Span::raw(""),
             };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{prefix}{}. {playing_marker}", index + 1), Style::default().fg(if app.now_playing == Some(index) { LIME } else { BLUE })),
+                Span::styled(format!("{prefix}{}. {playing_marker}", index + 1), Style::default().fg(if is_playing { LIME } else { BLUE })),
                 Span::styled(track.name.clone(), Style::default().fg(name_color)),
                 Span::styled(if track.remote_metadata.is_some() { "  ☁" } else { "" }, Style::default().fg(YELLOW)),
                 tidal_marker,
+                tag_state_span(app.tag_state(track_id)),
+                Span::styled(if in_playlists > 1 { format!("  ×{in_playlists}") } else { String::new() }, Style::default().fg(PINK)),
             ]))
         }).collect();
         let mut state = ListState::default();
         state.select(Some(view.selected));
         frame.render_stateful_widget(List::new(items).block(track_block).highlight_style(Style::default().bg(Color::Rgb(40, 0, 35)).fg(INK).add_modifier(Modifier::BOLD)), columns[0], &mut state);
-        draw_track_details(frame, view, columns[1]);
+        draw_track_details(frame, app, view, columns[1]);
     }
 
     let link_service = view.playlist.link.as_ref().map(|link| link.service);
@@ -206,7 +217,9 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
         pill("Enter / p", PANEL, INK),
         Span::styled(" play / pause   ", Style::default().fg(CYAN)),
         pill("x", PANEL, INK),
-        Span::styled(" stop", Style::default().fg(CYAN)),
+        Span::styled(" stop   ", Style::default().fg(CYAN)),
+        pill("g", PANEL, INK),
+        Span::styled(" re-fetch tags", Style::default().fg(CYAN)),
     ];
     if let Some(label) = match link_service {
         Some(crate::model::ImportService::SoundCloud) => Some("download audio"),
@@ -226,7 +239,7 @@ fn draw_playlist_page(frame: &mut Frame, app: &App, view: &crate::app::TrackView
     frame.render_widget(Paragraph::new(Line::from(footer)), vertical[4]);
 }
 
-fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rect) {
+fn draw_track_details(frame: &mut Frame, app: &App, view: &crate::app::TrackView, area: Rect) {
     let block = panel("♡ TRACK DETAILS ♡");
     let Some(track) = view.tracks.get(view.selected) else {
         frame.render_widget(Paragraph::new("").block(block), area);
@@ -272,6 +285,9 @@ fn draw_track_details(frame: &mut Frame, view: &crate::app::TrackView, area: Rec
         lines.push(Line::from(vec![Span::styled("duration: ", Style::default().fg(YELLOW)), Span::styled(format_duration(metadata.duration_secs), Style::default().fg(INK))]));
     } else {
         lines.push(Line::from(Span::styled("no audio tags found", Style::default().fg(BLUE))));
+    }
+    if let Some(id) = view.track_ids.get(view.selected) {
+        lines.extend(library_track_lines(app, id, Some((&view.crate_name, &view.playlist.name))));
     }
     if !is_remote {
         lines.push(Line::from(""));
@@ -420,7 +436,7 @@ fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(10), Constraint::Length(2), Constraint::Length(2)])
         .split(area);
-    draw_header(frame, vertical[0]);
+    draw_header(frame, app, vertical[0]);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
@@ -518,7 +534,7 @@ fn draw_import(frame: &mut Frame, app: &App, area: Rect) {
     use crate::model::ImportService;
 
     let vertical = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(5), Constraint::Length(2), Constraint::Min(8), Constraint::Length(2)]).split(area);
-    draw_header(frame, vertical[0]);
+    draw_header(frame, app, vertical[0]);
 
     let Some(import) = &app.import else {
         frame.render_widget(Paragraph::new(""), vertical[1]);
@@ -621,14 +637,14 @@ fn draw_import(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     let vertical = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(5), Constraint::Min(8), Constraint::Length(2)]).split(area);
-    draw_header(frame, vertical[0]);
+    draw_header(frame, app, vertical[0]);
 
     let crate_count = app.crates.len();
     let playlist_count: usize = app.crates.iter().map(|crate_location| crate_location.playlists.len()).sum();
     let path_count: usize = app.crates.iter().map(|crate_location| crate_location.locations.len()).sum();
 
-    let field_labels = ["Spotify Client ID", "Tidal Client ID", "Tidal Client Secret", "Tidal Country Code"];
-    let field_values = [app.spotify_client_id.as_deref(), app.tidal_client_id.as_deref(), app.tidal_client_secret.as_deref(), app.tidal_country_code.as_deref()];
+    let field_labels = ["Spotify Client ID", "Tidal Client ID", "Tidal Client Secret", "Tidal Country Code", "Last.fm API Key (optional, better genre tags)", "Cloud backup folder (iCloud/Dropbox/Drive synced dir)"];
+    let field_values = [app.spotify_client_id.as_deref(), app.tidal_client_id.as_deref(), app.tidal_client_secret.as_deref(), app.tidal_country_code.as_deref(), app.lastfm_api_key.as_deref(), app.cloud_backup_dir.as_deref()];
     let mut credential_lines = Vec::new();
     for (index, label) in field_labels.iter().enumerate() {
         let selected = app.settings_field == index;
@@ -642,11 +658,13 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             credential_lines.push(Line::from(vec![Span::styled("    ", Style::default()), Span::styled(before, Style::default().fg(INK)), Span::styled("█", Style::default().fg(INK)), Span::styled(after, Style::default().fg(INK))]));
         } else {
             // Mask the secret so it's not shown in plain text on screen.
-            let is_secret = index == 2;
+            let is_secret = index == 2 || index == 4;
             let display_value = match field_values[index] {
                 Some(value) if is_secret => "•".repeat(value.chars().count().min(24)),
                 Some(value) => value.to_string(),
                 None if index == 3 => "(not set, defaults to BR)".to_string(),
+                None if index == 4 => "(not set — using MusicBrainz)".to_string(),
+                None if index == 5 => "(not set — no cloud backup)".to_string(),
                 None => "(not set)".to_string(),
             };
             let color = if field_values[index].is_some() { CYAN } else { BLUE };
@@ -674,8 +692,19 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("Spotify session", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         session_line,
         Line::from(""),
+        Line::from(Span::styled("Cloud backup", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            match (&app.cloud_backup_dir, &app.backup_status) {
+                (None, _) => "  off — set a folder above (b backup now · B restore)".to_string(),
+                (Some(_), None) => "  not written yet this session (b backup now · B restore)".to_string(),
+                (Some(dir), Some(Ok(at))) => format!("  ☁ saved {} → {dir}/{}", format_age(*at), crate::library::BACKUP_FILE_NAME),
+                (Some(_), Some(Err(error))) => format!("  ✕ failed: {error}"),
+            },
+            Style::default().fg(if matches!(app.backup_status, Some(Err(_))) { PINK } else { CYAN }),
+        )),
+        Line::from(""),
         Line::from(Span::styled("Overview", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("  {crate_count} crates · {path_count} paths · {playlist_count} playlists"), Style::default().fg(INK))),
+        Line::from(Span::styled(format!("  {crate_count} crates · {path_count} paths · {playlist_count} playlists · {} library tracks", app.library.tracks.len()), Style::default().fg(INK))),
         Line::from(""),
         Line::from(Span::styled("Keybindings", Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  j/k, ↑/↓    navigate playlists", Style::default().fg(INK))),
@@ -683,6 +712,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("  c           manage crates", Style::default().fg(INK))),
         Line::from(Span::styled("  n           new crate", Style::default().fg(INK))),
         Line::from(Span::styled("  i           import / link a playlist", Style::default().fg(INK))),
+        Line::from(Span::styled("  b  or  /    explore the library (search by artist / title)", Style::default().fg(INK))),
         Line::from(Span::styled("  t / T       browse tags / edit tags", Style::default().fg(INK))),
         Line::from(Span::styled("  r           rescan playlists from disk", Style::default().fg(INK))),
         Line::from(Span::styled("  s           this screen", Style::default().fg(INK))),
@@ -702,19 +732,22 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             pill("Enter / e", PANEL, INK),
             Span::styled(" edit   ", Style::default().fg(CYAN)),
             pill("l / L", PANEL, INK),
-            Span::styled(" connect / disconnect Spotify", Style::default().fg(CYAN)),
+            Span::styled(" connect / disconnect Spotify   ", Style::default().fg(CYAN)),
+            pill("b / B", PANEL, INK),
+            Span::styled(" backup now / restore", Style::default().fg(CYAN)),
         ])
     };
     frame.render_widget(Paragraph::new(hint), vertical[2]);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let title = Line::from(vec![
         Span::styled("crate", Style::default().fg(PANEL).bg(LIME).add_modifier(Modifier::BOLD)),
         Span::styled("rat", Style::default().fg(PANEL).bg(PINK).add_modifier(Modifier::BOLD)),
-        Span::styled(" crate manager", Style::default().fg(CYAN)),
+        Span::styled(" crate manager   ", Style::default().fg(CYAN)),
+        Span::styled("🐀 🐁 🐭 🐹", Style::default().fg(YELLOW)),
     ]);
-    let subtitle = Line::from(Span::styled("🐀 🐁 🐭 🐹", Style::default().fg(YELLOW)));
+    let subtitle = activity_line(app);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -764,14 +797,21 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(Span::styled("  Add a crate with c, then n.", Style::default().fg(INK))).block(panel("♫ PLAYLISTS ♫")), area);
         return;
     };
-    let rows = crate_location.playlists.iter().map(|playlist| {
+    let rows = crate_location.playlists.iter().enumerate().map(|(playlist_index, playlist)| {
         let status_color = if playlist.link.is_some() && playlist.track_count == 0 { PINK } else if playlist.synced == playlist.track_count { LIME } else { PINK };
         let name = playlist.link.as_ref().map_or_else(|| playlist.name.clone(), |link| format!("{} [{}]", playlist.name, link.service.label()));
-        Row::new(vec![name, format!("{}/{}", playlist.synced, playlist.track_count), playlist.status().to_string(), playlist.tags.join("  ")]).style(Style::default().fg(INK)).style(Style::default().fg(status_color))
+        Row::new(vec![
+            Cell::from(name),
+            Cell::from(format!("{}/{}", playlist.synced, playlist.track_count)),
+            Cell::from(playlist.status().to_string()),
+            Cell::from(Line::from(activity_spans(&app.playlist_activity(app.selected_crate, playlist_index)))),
+            Cell::from(Line::from(tag_spans_for(&playlist.tags, &playlist.auto_tags))),
+        ])
+        .style(Style::default().fg(status_color))
     });
     let title: &'static str = if crate_location.locations.len() > 1 { "♫ PLAYLISTS (shared across paths) ♫" } else { "♫ PLAYLISTS ♫" };
-    let table = Table::new(rows, [Constraint::Percentage(32), Constraint::Length(10), Constraint::Length(12), Constraint::Min(10)])
-        .header(Row::new(vec!["PLAYLIST", "TRACKS", "STATUS", "TAGS"]).style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)))
+    let table = Table::new(rows, [Constraint::Percentage(26), Constraint::Length(9), Constraint::Length(11), Constraint::Length(16), Constraint::Min(10)])
+        .header(Row::new(vec!["PLAYLIST", "TRACKS", "STATUS", "SYNC", "TAGS"]).style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)))
         .block(panel(title))
         .row_highlight_style(Style::default().bg(Color::Rgb(40, 0, 35)).fg(INK).add_modifier(Modifier::BOLD));
     let mut state = TableState::default();
@@ -816,4 +856,274 @@ fn panel(title: &'static str) -> Block<'static> {
 
 fn pill(label: &str, fg: Color, bg: Color) -> Span<'static> {
     Span::styled(format!(" {} ", label), Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD))
+}
+/// One-line summary of everything running in the background, shown in the header on every
+/// screen so it's always clear what's being synced.
+fn activity_line(app: &App) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push = |spans: &mut Vec<Span<'static>>, text: String, color: Color| {
+        if !spans.is_empty() {
+            spans.push(Span::styled("   ", Style::default()));
+        }
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    };
+    let queued = app.tag_queue_len();
+    if queued > 0 {
+        let now = app.tag_in_flight.as_ref().and_then(|id| app.library.tracks.get(id)).map(|track| format!(" · now: {} — {}", if track.artist.is_empty() { "?" } else { &track.artist }, track.title)).unwrap_or_default();
+        push(&mut spans, format!("⟳ tags {queued} left{now}"), YELLOW);
+    }
+    if !app.tidal_refresh_queue.is_empty() {
+        push(&mut spans, format!("⟳ tidal: checking {} playlist(s)", app.tidal_refresh_queue.len()), CYAN);
+    }
+    if app.is_importing_new() {
+        push(&mut spans, "⟳ importing playlist".to_string(), CYAN);
+    }
+    if app.is_downloading() {
+        push(&mut spans, "⬇ downloading".to_string(), CYAN);
+    }
+    if !app.tag_errors.is_empty() {
+        push(&mut spans, format!("✕ {} tag lookup(s) failed (offline?)", app.tag_errors.len()), PINK);
+    }
+    match (&app.cloud_backup_dir, &app.backup_status) {
+        (Some(_), Some(Ok(at))) => push(&mut spans, format!("☁ backup {}", format_age(*at)), BLUE),
+        (Some(_), Some(Err(_))) => push(&mut spans, "☁ backup failed".to_string(), PINK),
+        _ => {}
+    }
+    let busy = queued > 0 || !app.tidal_refresh_queue.is_empty() || app.is_downloading() || app.is_importing_new();
+    if !busy {
+        spans.insert(0, Span::styled(format!("✓ up to date · {} tracks in library", app.library.tracks.len()), Style::default().fg(LIME)));
+        if spans.len() > 1 {
+            spans.insert(1, Span::styled("   ", Style::default()));
+        }
+    }
+    Line::from(spans)
+}
+
+fn activity_spans(activities: &[Activity]) -> Vec<Span<'static>> {
+    if activities.is_empty() {
+        return vec![Span::styled("✓", Style::default().fg(LIME))];
+    }
+    let mut spans = Vec::new();
+    for activity in activities {
+        let (text, color) = match activity {
+            Activity::Tidal(true) => ("⟳ tidal".to_string(), CYAN),
+            Activity::Tidal(false) => ("… tidal".to_string(), BLUE),
+            Activity::Importing => ("⟳ import".to_string(), CYAN),
+            Activity::Downloading => ("⬇ dl".to_string(), CYAN),
+            Activity::Tags { left, active: true } => (format!("⟳ tags {left}"), YELLOW),
+            Activity::Tags { left, active: false } => (format!("… tags {left}"), BLUE),
+        };
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    spans
+}
+
+/// Hand-written tags in white, tags derived from the tracks as `#tag` in blue.
+fn tag_spans_for(user_tags: &[String], auto_tags: &[String]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for tag in user_tags {
+        spans.push(Span::styled(format!("{tag}  "), Style::default().fg(INK)));
+    }
+    for tag in auto_tags.iter().filter(|tag| !user_tags.iter().any(|user| user.eq_ignore_ascii_case(tag))) {
+        spans.push(Span::styled(format!("#{tag} "), Style::default().fg(BLUE)));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled("—", Style::default().fg(BLUE)));
+    }
+    spans
+}
+
+fn tag_state_span(state: TagState) -> Span<'static> {
+    match state {
+        TagState::Syncing => Span::styled("  ⟳ tags", Style::default().fg(YELLOW)),
+        TagState::Queued => Span::styled("  …", Style::default().fg(BLUE)),
+        TagState::Failed => Span::styled("  ✕ tags", Style::default().fg(PINK)),
+        TagState::Done | TagState::NotFound | TagState::Waiting => Span::raw(""),
+    }
+}
+
+fn tag_state_label(state: TagState) -> (&'static str, Color) {
+    match state {
+        TagState::Syncing => ("⟳ looking up now…", YELLOW),
+        TagState::Queued => ("… queued for lookup", BLUE),
+        TagState::Failed => ("✕ lookup failed (offline?) — g to retry", PINK),
+        TagState::Done => ("✓ synced", LIME),
+        TagState::NotFound => ("✓ looked up — nothing found online", BLUE),
+        TagState::Waiting => ("pending", BLUE),
+    }
+}
+
+/// Library facts for a track: online tags + sync state, service ids, local copies, and every
+/// playlist it's in (the current one, if given, marked).
+fn library_track_lines(app: &App, id: &str, current: Option<(&str, &str)>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(track) = app.library.tracks.get(id) else { return lines };
+    lines.push(Line::from(""));
+    let tags = if track.tags.is_empty() { "—".to_string() } else { track.tags.join(", ") };
+    lines.push(Line::from(vec![Span::styled("tags: ", Style::default().fg(YELLOW)), Span::styled(tags, Style::default().fg(INK))]));
+    let (label, color) = tag_state_label(app.tag_state(id));
+    let source = match (&track.tags_source, track.tags_updated_secs) {
+        (Some(source), Some(at)) if app.tag_state(id) == TagState::Done => format!("  ({source}, {})", format_age(at)),
+        _ => String::new(),
+    };
+    lines.push(Line::from(vec![Span::styled("tag sync: ", Style::default().fg(YELLOW)), Span::styled(format!("{label}{source}"), Style::default().fg(color))]));
+    if !track.external_ids.is_empty() {
+        let ids = track.external_ids.iter().map(|(service, external_id)| format!("{service}:{external_id}")).collect::<Vec<_>>().join("  ");
+        lines.push(Line::from(vec![Span::styled("ids: ", Style::default().fg(YELLOW)), Span::styled(ids, Style::default().fg(CYAN))]));
+    }
+    let copies = app.library.files_for(id).len();
+    lines.push(Line::from(vec![Span::styled("local copies: ", Style::default().fg(YELLOW)), Span::styled(copies.to_string(), Style::default().fg(if copies > 0 { LIME } else { BLUE }))]));
+    let playlists = app.playlists_for(id);
+    lines.push(Line::from(Span::styled(format!("in {} playlist(s):", playlists.len()), Style::default().fg(YELLOW))));
+    for (crate_name, playlist_name) in playlists {
+        let is_current = current.is_some_and(|(current_crate, current_playlist)| current_crate == crate_name && current_playlist == playlist_name);
+        lines.push(Line::from(vec![
+            Span::styled(if is_current { "  ● " } else { "  ○ " }, Style::default().fg(if is_current { LIME } else { PINK })),
+            Span::styled(playlist_name.clone(), Style::default().fg(if is_current { INK } else { CYAN })),
+            Span::styled(format!("  [{crate_name}]"), Style::default().fg(BLUE)),
+        ]));
+    }
+    lines
+}
+
+fn format_age(secs: u64) -> String {
+    format_relative_time(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(browser) = &app.library_browser else { return };
+    let vertical = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(5), Constraint::Length(3), Constraint::Min(6), Constraint::Length(1), Constraint::Length(2)]).split(area);
+    draw_header(frame, app, vertical[0]);
+
+    let search_style = Style::default().fg(if browser.editing { INK } else { CYAN });
+    let mut search = vec![Span::styled("🔎 ", Style::default().fg(YELLOW)), Span::styled(browser.query.clone(), search_style)];
+    if browser.editing {
+        search.push(Span::styled("█", Style::default().fg(INK)));
+    } else if browser.query.is_empty() {
+        search.push(Span::styled("press / to search by artist, title, album or tag", Style::default().fg(BLUE)));
+    }
+    let track_count = browser.rows.iter().filter(|row| matches!(row, LibraryRow::Track(_))).count();
+    search.push(Span::styled(format!("   {track_count}/{} tracks · {}", app.library.tracks.len(), if browser.by_artist { "by artist" } else { "by title" }), Style::default().fg(BLUE)));
+    frame.render_widget(Paragraph::new(Line::from(search)).block(panel("✦ SEARCH ✦")), vertical[1]);
+
+    let columns = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(52), Constraint::Percentage(48)]).split(vertical[2]);
+    let with_files: std::collections::HashSet<&str> = app.library.files.values().map(|entry| entry.track_id.as_str()).collect();
+    let items: Vec<ListItem> = browser
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let selected = index == browser.selected;
+            match row {
+                LibraryRow::Artist { name, count } => ListItem::new(Line::from(vec![
+                    Span::styled(format!("{}♪ {name}", if selected { "› " } else { "" }), Style::default().fg(PINK).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  ({count})"), Style::default().fg(BLUE)),
+                ])),
+                LibraryRow::Track(id) => {
+                    let Some(track) = app.library.tracks.get(id) else { return ListItem::new("") };
+                    let has_file = with_files.contains(id.as_str());
+                    let is_playing = app.now_playing.as_ref().is_some_and(|path| app.library.files.get(&path.to_string_lossy().to_string()).is_some_and(|entry| entry.track_id == *id));
+                    let indent = if browser.by_artist { "    " } else { "  " };
+                    let mut spans = vec![
+                        Span::styled(format!("{indent}{}", if is_playing { if app.audio_paused { "⏸ " } else { "▶ " } } else { "" }), Style::default().fg(LIME)),
+                        Span::styled(track.title.clone(), Style::default().fg(if !has_file { BLUE } else if selected { INK } else { CYAN })),
+                    ];
+                    if !browser.by_artist {
+                        spans.push(Span::styled(format!(" — {}", if track.artist.is_empty() { "?" } else { &track.artist }), Style::default().fg(BLUE)));
+                    }
+                    if !has_file {
+                        spans.push(Span::styled("  ☁", Style::default().fg(YELLOW)));
+                    }
+                    let in_playlists = app.playlists_for(id).len();
+                    if in_playlists > 1 {
+                        spans.push(Span::styled(format!("  ×{in_playlists}"), Style::default().fg(PINK)));
+                    }
+                    spans.push(tag_state_span(app.tag_state(id)));
+                    ListItem::new(Line::from(spans))
+                }
+            }
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(browser.selected));
+    let title: &'static str = if browser.by_artist { "♫ LIBRARY · BY ARTIST ♫" } else { "♫ LIBRARY · BY TITLE ♫" };
+    frame.render_stateful_widget(List::new(items).block(panel(title)).highlight_style(Style::default().bg(Color::Rgb(40, 0, 35)).fg(INK).add_modifier(Modifier::BOLD)), columns[0], &mut state);
+
+    let details = match browser.rows.get(browser.selected) {
+        Some(LibraryRow::Track(id)) => library_track_details(app, id),
+        Some(LibraryRow::Artist { name, count }) => artist_details(app, browser, name, *count),
+        None => vec![Line::from(Span::styled("No tracks match.", Style::default().fg(BLUE)))],
+    };
+    frame.render_widget(Paragraph::new(details).wrap(ratatui::widgets::Wrap { trim: false }).block(panel("♡ METADATA ♡")), columns[1]);
+
+    frame.render_widget(Paragraph::new(Span::styled(format!("  {}", app.message), Style::default().fg(YELLOW))), vertical[3]);
+    let footer = if browser.editing {
+        Line::from(vec![pill("Enter", BACKDROP, PINK), Span::styled(" done   ", Style::default().fg(CYAN)), pill("Esc", PANEL, INK), Span::styled(" clear search", Style::default().fg(CYAN))])
+    } else {
+        Line::from(vec![
+            pill("Esc", BACKDROP, PINK),
+            Span::styled(" back   ", Style::default().fg(CYAN)),
+            pill("/", PANEL, INK),
+            Span::styled(" search   ", Style::default().fg(CYAN)),
+            pill("Tab", PANEL, INK),
+            Span::styled(" artist/title   ", Style::default().fg(CYAN)),
+            pill("J/K", PANEL, INK),
+            Span::styled(" next/prev artist   ", Style::default().fg(CYAN)),
+            pill("Enter / p", PANEL, INK),
+            Span::styled(" play   ", Style::default().fg(CYAN)),
+            pill("x", PANEL, INK),
+            Span::styled(" stop   ", Style::default().fg(CYAN)),
+            pill("o", PANEL, INK),
+            Span::styled(" open playlist   ", Style::default().fg(CYAN)),
+            pill("g", PANEL, INK),
+            Span::styled(" re-fetch tags", Style::default().fg(CYAN)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(footer), vertical[4]);
+}
+
+fn library_track_details(app: &App, id: &str) -> Vec<Line<'static>> {
+    let Some(track) = app.library.tracks.get(id) else { return Vec::new() };
+    let field = |label: &str, value: String| Line::from(vec![Span::styled(format!("{label}: "), Style::default().fg(YELLOW)), Span::styled(if value.is_empty() { "—".to_string() } else { value }, Style::default().fg(INK))]);
+    let mut lines = vec![
+        Line::from(Span::styled(track.title.clone(), Style::default().fg(INK).add_modifier(Modifier::BOLD))),
+        field("artist", track.artist.clone()),
+        field("album", track.album.clone()),
+        field("year", track.year.map(|year| year.to_string()).unwrap_or_default()),
+        field("duration", if track.duration_secs > 0 { format_duration(track.duration_secs) } else { String::new() }),
+        field("genre (file)", track.genres.join(", ")),
+    ];
+    lines.extend(library_track_lines(app, id, None));
+    if let Some(path) = app.library.files_for(id).first() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(path.display().to_string(), Style::default().fg(BLUE))));
+    }
+    lines
+}
+
+fn artist_details(app: &App, browser: &crate::app::LibraryBrowser, name: &str, count: usize) -> Vec<Line<'static>> {
+    // The artist's tracks are the rows right after its header.
+    let position = browser.selected;
+    let ids: Vec<String> = browser.rows.iter().skip(position + 1).take(count).filter_map(|row| match row {
+        LibraryRow::Track(id) => Some(id.clone()),
+        LibraryRow::Artist { .. } => None,
+    }).collect();
+    let tags = app.library.playlist_tags(&ids);
+    let mut playlists: Vec<(String, String)> = ids.iter().flat_map(|id| app.playlists_for(id).iter().cloned()).collect();
+    playlists.sort();
+    playlists.dedup();
+    let mut lines = vec![
+        Line::from(Span::styled(name.to_string(), Style::default().fg(PINK).add_modifier(Modifier::BOLD))),
+        Line::from(vec![Span::styled("tracks: ", Style::default().fg(YELLOW)), Span::styled(count.to_string(), Style::default().fg(INK))]),
+        Line::from(vec![Span::styled("tags: ", Style::default().fg(YELLOW)), Span::styled(if tags.is_empty() { "—".to_string() } else { tags.join(", ") }, Style::default().fg(INK))]),
+        Line::from(""),
+        Line::from(Span::styled(format!("in {} playlist(s):", playlists.len()), Style::default().fg(YELLOW))),
+    ];
+    for (crate_name, playlist_name) in playlists {
+        lines.push(Line::from(vec![Span::styled("  ○ ", Style::default().fg(PINK)), Span::styled(playlist_name, Style::default().fg(CYAN)), Span::styled(format!("  [{crate_name}]"), Style::default().fg(BLUE))]));
+    }
+    lines
 }

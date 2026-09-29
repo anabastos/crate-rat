@@ -20,6 +20,13 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 rodio = "0.19"
+# Decodes playback audio ourselves (see src/player.rs): every common DJ format, including
+# AAC/ALAC in .m4a — what tidal-dl-ng usually saves — which rodio's defaults can't play.
+symphonia = { version = "0.5", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+# Only to point stderr at a log file while the TUI is up (see main.rs).
+libc = "0.2"
 
 [profile.release]
 lto = true

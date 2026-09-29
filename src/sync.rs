@@ -66,7 +66,7 @@ pub fn scan_crate_playlists(crate_location: &CrateLocation) -> Vec<Playlist> {
         .into_values()
         .map(|(name, track_count, downloaded_count, seen_in)| {
             let synced = if seen_in >= location_count { downloaded_count.min(track_count) } else { 0 };
-            Playlist { name, track_count, synced, tags: Vec::new(), link: None }
+            Playlist { name, track_count, synced, tags: Vec::new(), link: None, track_ids: Vec::new(), auto_tags: Vec::new() }
         })
         .collect()
 }
@@ -161,7 +161,7 @@ pub fn list_playlist_tracks(crate_location: &CrateLocation, playlist_name: &str)
 /// punctuation stripped and whitespace collapsed, since downloaders routinely rename tracks just
 /// enough (dropping quotes/colons, tweaking "Remaster" formatting, etc.) that a literal substring
 /// match on the raw title fails even though it's clearly the same track.
-fn normalize_for_match(text: &str) -> String {
+pub fn normalize_for_match(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut last_was_space = false;
     for character in text.to_lowercase().chars() {

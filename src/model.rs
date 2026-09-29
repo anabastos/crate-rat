@@ -24,6 +24,14 @@ pub struct Playlist {
     pub tags: Vec<String>,
     #[serde(default)]
     pub link: Option<PlaylistLink>,
+    /// Library ids (see `library::track_key`) of the tracks in this playlist, in order. The
+    /// playlist only references tracks; their metadata lives once, in the library.
+    #[serde(default)]
+    pub track_ids: Vec<String>,
+    /// Genre tags derived from the tags of the tracks this playlist holds (kept apart from the
+    /// hand-written `tags` so a rescan never overwrites what the user typed).
+    #[serde(default)]
+    pub auto_tags: Vec<String>,
 }
 
 impl Playlist {
@@ -57,4 +65,4 @@ impl ImportService {
             ImportService::SoundCloud => "SoundCloud",
         }
     }
-}
+}
