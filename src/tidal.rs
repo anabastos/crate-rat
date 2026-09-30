@@ -404,6 +404,9 @@ impl NoiseFilter {
     }
 
     fn filter(&mut self, line: &str, on_line: &mut dyn FnMut(&str)) {
+        if is_expected_ffmpeg_warning(line) {
+            return;
+        }
         if is_locals_dump_line(line) {
             self.hidden += 1;
             return;
@@ -431,6 +434,17 @@ fn is_locals_dump_line(line: &str) -> bool {
     let Some(eq_pos) = trimmed.find(" = ") else { return false };
     let name = &trimmed[..eq_pos];
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `tidal-dl-ng` warns about FFmpeg being unavailable/unconfigured on every single lossless
+/// track, even though `set_tidal_dl_ng_download_path` deliberately sets `extract_flac: False` so
+/// FFmpeg is never actually needed — these three lines are expected, not actionable, and just
+/// repeat per track.
+fn is_expected_ffmpeg_warning(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("FFmpeg path is not set.")
+        || trimmed.starts_with("FLAC cannot be extracted from MP4 containers.")
+        || trimmed.contains("path_binary_ffmpeg")
 }
 
 fn run_tidal_dl_ng(args: &[&str], timeout: Duration, mut on_line: impl FnMut(&str)) -> Result<(), String> {
