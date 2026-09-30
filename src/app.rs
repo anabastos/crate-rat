@@ -2080,21 +2080,25 @@ impl App {
                 let mut downloaded = 0usize;
                 let mut log = Vec::with_capacity(pairs.len());
                 for (index, (title, artist)) in pairs.iter().enumerate() {
-                    let _ = tx.send(TidalDownloadUpdate::Progress { index: index + 1, total, title: title.clone() });
+                    // Shown/logged everywhere instead of the bare title, so the UI reads
+                    // "Song — Artist" rather than a title alone that may be ambiguous
+                    // (covers, remixes, same title by different artists).
+                    let label = if artist.is_empty() { title.clone() } else { format!("{title} — {artist}") };
+                    let _ = tx.send(TidalDownloadUpdate::Progress { index: index + 1, total, title: label.clone() });
                     let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Finding));
                     let find_log_tx = tx.clone();
-                    let find_title = title.clone();
+                    let find_label = label.clone();
                     let found = finder.find_track_url(&country_code, title, artist, |line| {
-                        let _ = find_log_tx.send(TidalDownloadUpdate::Log { title: find_title.clone(), line: line.to_string() });
+                        let _ = find_log_tx.send(TidalDownloadUpdate::Log { title: find_label.clone(), line: line.to_string() });
                     });
 
                     let status = match found {
                         Ok(Some(url)) => {
-                            let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: "found — downloading via tidal-dl-ng…".to_string() });
+                            let _ = tx.send(TidalDownloadUpdate::Log { title: label.clone(), line: "found — downloading via tidal-dl-ng…".to_string() });
                             let _ = tx.send(TidalDownloadUpdate::Phase(LogPhase::Downloading));
                             let line_tx = tx.clone();
                             let outcome = tidal::download_via_tidal_dl_ng(&url, |line| {
-                                let _ = line_tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: line.to_string() });
+                                let _ = line_tx.send(TidalDownloadUpdate::Log { title: label.clone(), line: line.to_string() });
                             });
                             match outcome {
                                 Ok(()) => {
@@ -2111,8 +2115,8 @@ impl App {
                         Ok(None) => "not found on Tidal".to_string(),
                         Err(error) => format!("search error: {error}"),
                     };
-                    let _ = tx.send(TidalDownloadUpdate::Log { title: title.clone(), line: status.clone() });
-                    log.push((title.clone(), status));
+                    let _ = tx.send(TidalDownloadUpdate::Log { title: label.clone(), line: status.clone() });
+                    log.push((label.clone(), status));
                 }
                 Ok(TidalDownloadOutcome { downloaded, log, has_more })
             })();
@@ -2174,7 +2178,10 @@ impl App {
                 let more_suffix = if has_more { " Press D again for the next batch." } else { "" };
                 self.message = if failed == 0 { format!("Downloaded {downloaded} track(s) via Tidal.{more_suffix}") } else { format!("Downloaded {downloaded} track(s) via Tidal, {failed} not found or failed.{more_suffix}") };
                 self.rescan_current_playlist();
-                self.tidal_log = None;
+                // Unlike the single-pane playlist download, don't auto-close the log here — a
+                // batch is capped at TIDAL_DOWNLOAD_BATCH_LIMIT tracks, and wiping it now would
+                // defeat the "press D again to keep going, scroll back through everything"
+                // behavior described where this batch started. Esc still closes it manually.
             }
             Some(Err(error)) => {
                 self.spotify_tidal_download_rx = None;
