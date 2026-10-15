@@ -11,6 +11,7 @@ use crate::library::{self, Library, LibraryTrack, TagStatus};
 use crate::metadata::{self, TrackMetadata};
 use crate::player;
 use crate::rekordbox;
+use crate::scan;
 use crate::model::{CrateLocation, ImportService, Location, Playlist, PlaylistLink};
 use crate::soundcloud;
 use crate::spotify;
@@ -107,6 +108,10 @@ pub struct App {
     /// The last rekordbox read: master.db's modification time and its playlists, in rekordbox's
     /// order. Re-read only when rekordbox has written to its library since.
     rekordbox_cache: Option<(Option<std::time::SystemTime>, Vec<rekordbox::RekordboxPlaylist>)>,
+    /// The background rescan of every crate, while it runs (see `scan.rs`).
+    scan_rx: Option<std::sync::mpsc::Receiver<scan::ScanResult>>,
+    /// Tags the background scan already read, consumed as its results are applied.
+    prefetched_tags: HashMap<String, Option<metadata::TrackMetadata>>,
 }
 
 struct PendingImport {
@@ -407,6 +412,8 @@ impl App {
             tidal_refreshed_crates: std::collections::HashSet::new(),
             rekordbox_crate_added: false,
             rekordbox_cache: None,
+            scan_rx: None,
+            prefetched_tags: HashMap::new(),
         }
     }
 
@@ -667,12 +674,13 @@ impl App {
             }
             Err(error) => app.message = format!("Could not read the library ({error}) — rebuilding it from disk."),
         }
-        app.library.prune_missing_files();
         app.add_rekordbox_crate();
         app.tag_worker = Some(TagWorker::spawn(app.lastfm_api_key.clone()));
-        app.refresh_availability();
-        app.rescan_playlists();
-        let _ = app.save_config();
+        // Show what was saved last time right away: the crates, playlists and their track ids
+        // are all in config.json. Disk (and rekordbox) is rescanned in the background, and each
+        // playlist's own tracks are only read when it's opened.
+        app.refresh_derived();
+        app.start_scan();
         app.start_tidal_crate_refresh(app.selected_crate);
         app
     }
@@ -717,8 +725,7 @@ impl App {
     /// On failure the crate keeps what it last showed and the error goes to the status line.
     fn scan_rekordbox_crate(&mut self, crate_index: usize) -> Option<Vec<Playlist>> {
         let db_path = PathBuf::from(&self.crates.get(crate_index)?.locations.first()?.path);
-        let modified = |path: &std::path::Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
-        let stamp = modified(&db_path).max(modified(&PathBuf::from(format!("{}-wal", db_path.display()))));
+        let stamp = scan::rekordbox_stamp(&db_path);
         if self.rekordbox_cache.as_ref().is_none_or(|(cached, _)| *cached != stamp) {
             match rekordbox::load_playlists(&db_path) {
                 Ok(playlists) => self.rekordbox_cache = Some((stamp, playlists)),
@@ -728,6 +735,11 @@ impl App {
                 }
             }
         }
+        self.rekordbox_playlists()
+    }
+
+    /// The REKORD crate's playlists, from the rekordbox library already read into memory.
+    fn rekordbox_playlists(&self) -> Option<Vec<Playlist>> {
         let (_, cache) = self.rekordbox_cache.as_ref()?;
         Some(
             cache
@@ -749,21 +761,24 @@ impl App {
     fn rescan_crate_quiet(&mut self, crate_index: usize) {
         if self.crates.get(crate_index).is_some_and(|crate_location| crate_location.rekordbox) {
             let Some(scanned) = self.scan_rekordbox_crate(crate_index) else { return };
-            self.apply_scanned_playlists(crate_index, scanned);
+            self.apply_scanned_playlists(crate_index, scanned, None);
             return;
         }
         let Some(crate_location) = self.crates.get(crate_index) else { return };
         let scanned = sync::scan_crate_playlists(crate_location);
-        self.apply_scanned_playlists(crate_index, scanned);
+        self.apply_scanned_playlists(crate_index, scanned, None);
     }
 
-    fn apply_scanned_playlists(&mut self, crate_index: usize, scanned: Vec<Playlist>) {
+    /// Replaces a crate's playlists with freshly scanned ones and resolves their tracks.
+    /// `listings` holds each playlist's tracks when the background scan already listed them.
+    fn apply_scanned_playlists(&mut self, crate_index: usize, scanned: Vec<Playlist>, mut listings: Option<&mut HashMap<String, Vec<TrackFile>>>) {
         let Some(crate_location) = self.crates.get(crate_index) else { return };
         let merged = merge_playlists(&crate_location.playlists, scanned);
         self.crates[crate_index].playlists = merged;
         for playlist_index in 0..self.crates[crate_index].playlists.len() {
             let name = self.crates[crate_index].playlists[playlist_index].name.clone();
-            let (_, ids) = self.playlist_tracks(crate_index, &name);
+            let listed = listings.as_deref_mut().and_then(|listings| listings.remove(&name.to_lowercase()));
+            let (_, ids) = self.playlist_tracks_from(crate_index, &name, listed);
             let mut unique: Vec<String> = Vec::with_capacity(ids.len());
             for id in ids {
                 if !unique.contains(&id) {
@@ -784,6 +799,11 @@ impl App {
     /// library id of each. A manifest entry whose song already has a local file in the
     /// playlist is dropped — it's the same track, already downloaded.
     fn playlist_tracks(&mut self, crate_index: usize, playlist_name: &str) -> (Vec<TrackFile>, Vec<String>) {
+        self.playlist_tracks_from(crate_index, playlist_name, None)
+    }
+
+    /// `playlist_tracks`, with the folder listing already taken (by the background scan).
+    fn playlist_tracks_from(&mut self, crate_index: usize, playlist_name: &str, listed: Option<Vec<TrackFile>>) -> (Vec<TrackFile>, Vec<String>) {
         let Some(crate_location) = self.crates.get(crate_index) else { return (Vec::new(), Vec::new()) };
         if crate_location.rekordbox {
             let listed = self.rekordbox_cache.as_ref().and_then(|(_, cache)| cache.iter().find(|playlist| playlist.name.eq_ignore_ascii_case(playlist_name)));
@@ -798,11 +818,15 @@ impl App {
             return (files, ids);
         }
         let link = crate_location.playlists.iter().find(|playlist| playlist.name.eq_ignore_ascii_case(playlist_name)).and_then(|playlist| playlist.link.clone());
-        let listed = sync::list_playlist_tracks(crate_location, playlist_name);
+        let listed = listed.unwrap_or_else(|| sync::list_playlist_tracks(crate_location, playlist_name));
         let resolved: Vec<(TrackFile, String)> = listed
             .into_iter()
             .map(|track| {
-                let id = self.library.resolve(&track, link.as_ref());
+                let prefetched = if track.remote_metadata.is_none() { self.prefetched_tags.remove(track.path.to_string_lossy().as_ref()) } else { None };
+                let id = match prefetched {
+                    Some(tags) => self.library.resolve_file_with(&track, tags),
+                    None => self.library.resolve(&track, link.as_ref()),
+                };
                 (track, id)
             })
             .collect();
@@ -1000,6 +1024,9 @@ impl App {
             self.message = "That playlist isn't there anymore — press r to rescan.".into();
             return;
         };
+        if crate_location.rekordbox && self.rekordbox_cache.is_none() && self.is_scanning() {
+            self.message = "Still reading rekordbox's library — its tracks show up here in a moment.".into();
+        }
         let (tracks, track_ids) = self.playlist_tracks(crate_index, playlist_name);
         let tidal_status = vec![None; tracks.len()];
         self.tracks = Some(TrackView { crate_name, playlist, tracks, track_ids, selected: 0, metadata: None, cover: None, tidal_status });
@@ -1159,16 +1186,8 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                self.refresh_availability();
-                self.rescan_playlists();
-                self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
-                let missing: Vec<String> = self.crates.iter().filter(|crate_location| !crate_location.available).map(|crate_location| crate_location.name.clone()).collect();
-                let save_note = if self.save_config().is_ok() { "" } else { " (could not save)" };
-                self.message = if missing.is_empty() {
-                    format!("Playlists rescanned from disk.{save_note}")
-                } else {
-                    format!("Playlists rescanned. Missing paths: {}.{save_note}", missing.join(", "))
-                };
+                self.start_scan();
+                self.message = "Rescanning playlists in the background…".into();
             }
             KeyCode::Char('c') => {
                 self.screen = Screen::Config;
@@ -2829,11 +2848,70 @@ impl App {
         }
     }
 
-    fn rescan_playlists(&mut self) {
-        for crate_index in 0..self.crates.len() {
-            self.rescan_crate_quiet(crate_index);
+    /// Starts rescanning every crate in the background (no-op if one is already running).
+    fn start_scan(&mut self) {
+        if self.scan_rx.is_some() {
+            return;
         }
+        let rekordbox_cached = self.rekordbox_cache.as_ref().map(|(stamp, _)| *stamp);
+        self.scan_rx = Some(scan::start(self.crates.clone(), self.library.files.clone(), rekordbox_cached));
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.scan_rx.is_some()
+    }
+
+    /// Applies the background rescan once it's done.
+    pub fn poll_scan(&mut self) {
+        let Some(rx) = &self.scan_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.scan_rx = None;
+                return;
+            }
+        };
+        self.scan_rx = None;
+        for path in &result.missing_files {
+            self.library.files.remove(path);
+        }
+        self.prefetched_tags = result.tags;
+        let mut errors = Vec::new();
+        for (crate_name, available, found) in result.crates {
+            // Crates may have been renamed or removed while the scan ran.
+            let Some(crate_index) = self.crates.iter().position(|crate_location| crate_location.name == crate_name) else { continue };
+            self.crates[crate_index].available = available;
+            match found {
+                scan::CrateScan::Folders { playlists, mut listings } => self.apply_scanned_playlists(crate_index, playlists, Some(&mut listings)),
+                scan::CrateScan::Rekordbox { stamp, playlists } => {
+                    self.rekordbox_cache = Some((stamp, playlists));
+                    if let Some(scanned) = self.rekordbox_playlists() {
+                        self.apply_scanned_playlists(crate_index, scanned, None);
+                    }
+                }
+                scan::CrateScan::RekordboxUnchanged => {
+                    if let Some(scanned) = self.rekordbox_playlists() {
+                        self.apply_scanned_playlists(crate_index, scanned, None);
+                    }
+                }
+                scan::CrateScan::Failed(error) => errors.push(error),
+            }
+        }
+        self.prefetched_tags.clear();
+        self.library_dirty = true;
+        self.selected_playlist = self.selected_playlist.min(self.current_playlists().len().saturating_sub(1));
         self.refresh_derived();
+        self.reload_open_playlist(false);
+        let missing: Vec<String> = self.crates.iter().filter(|crate_location| !crate_location.available).map(|crate_location| crate_location.name.clone()).collect();
+        let save_note = if self.save_config().is_ok() { "" } else { " (could not save)" };
+        self.message = if let Some(error) = errors.first() {
+            error.clone()
+        } else if missing.is_empty() {
+            format!("Playlists rescanned from disk.{save_note}")
+        } else {
+            format!("Playlists rescanned. Missing paths: {}.{save_note}", missing.join(", "))
+        };
     }
 }
 

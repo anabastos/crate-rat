@@ -105,6 +105,10 @@ pub fn track_key(artist: &str, title: &str) -> String {
     format!("{}|{}", normalize_for_match(artist), normalize_for_match(title))
 }
 
+fn modified_secs(track: &TrackFile) -> u64 {
+    track.modified.and_then(|modified| modified.duration_since(UNIX_EPOCH).ok()).map_or(0, |elapsed| elapsed.as_secs())
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())
 }
@@ -225,16 +229,28 @@ impl Library {
 
     /// Library id for a local audio file, reading its tags only if it's new or changed.
     pub fn resolve_file(&mut self, track: &TrackFile) -> String {
-        let key = track.path.to_string_lossy().to_string();
-        let modified_secs = track.modified.and_then(|modified| modified.duration_since(UNIX_EPOCH).ok()).map_or(0, |elapsed| elapsed.as_secs());
-        if let Some(entry) = self.files.get(&key) {
-            if entry.size_bytes == track.size_bytes && entry.modified_secs == modified_secs && self.tracks.contains_key(&entry.track_id) {
-                return entry.track_id.clone();
-            }
+        if let Some(id) = self.cached_file(track) {
+            return id;
         }
-
-        let (file_artist, file_title) = info_from_filename(&track.name);
         let tags = metadata::read_track_metadata(&track.path);
+        self.resolve_file_with(track, tags)
+    }
+
+    /// The track a file holds, if its tags were read before and it hasn't changed since.
+    pub fn cached_file(&self, track: &TrackFile) -> Option<String> {
+        let entry = self.files.get(track.path.to_string_lossy().as_ref())?;
+        let unchanged = entry.size_bytes == track.size_bytes && entry.modified_secs == modified_secs(track) && self.tracks.contains_key(&entry.track_id);
+        unchanged.then(|| entry.track_id.clone())
+    }
+
+    /// Like `resolve_file`, with the file's tags already read (by the background scan).
+    pub fn resolve_file_with(&mut self, track: &TrackFile, tags: Option<metadata::TrackMetadata>) -> String {
+        if let Some(id) = self.cached_file(track) {
+            return id;
+        }
+        let key = track.path.to_string_lossy().to_string();
+        let modified_secs = modified_secs(track);
+        let (file_artist, file_title) = info_from_filename(&track.name);
         let pick = |tag: Option<String>, fallback: &str| tag.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).unwrap_or_else(|| fallback.to_string());
         let info = match tags {
             Some(tags) => TrackInfo {
@@ -287,11 +303,6 @@ impl Library {
     /// Local files (that still exist) holding this track.
     pub fn files_for(&self, id: &str) -> Vec<PathBuf> {
         self.files.iter().filter(|(_, entry)| entry.track_id == id).map(|(path, _)| PathBuf::from(path)).filter(|path| path.exists()).collect()
-    }
-
-    /// Forgets cached files that no longer exist on disk (the tracks themselves stay).
-    pub fn prune_missing_files(&mut self) {
-        self.files.retain(|path, _| Path::new(path).exists());
     }
 
     /// Tags that describe a playlist as a whole: the ones shared by a meaningful slice of its

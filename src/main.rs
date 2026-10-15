@@ -5,6 +5,7 @@ mod metadata;
 mod model;
 mod player;
 mod rekordbox;
+mod scan;
 mod soundcloud;
 mod splash;
 mod spotify;
@@ -97,6 +98,7 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), B
         app.poll_tidal_playlist_download();
         app.poll_tidal_crate_refresh();
         app.poll_tags();
+        app.poll_scan();
         app.poll_playback();
         terminal.draw(|frame| ui::draw(frame, &app))?;
         if event::poll(std::time::Duration::from_millis(250))? {

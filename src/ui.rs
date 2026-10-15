@@ -935,6 +935,9 @@ fn activity_line(app: &App) -> Line<'static> {
     if !app.tidal_refresh_queue.is_empty() {
         push(&mut spans, format!("⟳ tidal: checking {} playlist(s)", app.tidal_refresh_queue.len()), CYAN);
     }
+    if app.is_scanning() {
+        push(&mut spans, "⟳ scanning crates".to_string(), CYAN);
+    }
     if app.is_importing_new() {
         push(&mut spans, "⟳ importing playlist".to_string(), CYAN);
     }
@@ -949,7 +952,7 @@ fn activity_line(app: &App) -> Line<'static> {
         (Some(_), Some(Err(_))) => push(&mut spans, "☁ backup failed".to_string(), PINK),
         _ => {}
     }
-    let busy = queued > 0 || !app.tidal_refresh_queue.is_empty() || app.is_downloading() || app.is_importing_new();
+    let busy = queued > 0 || app.is_scanning() || !app.tidal_refresh_queue.is_empty() || app.is_downloading() || app.is_importing_new();
     if !busy {
         spans.insert(0, Span::styled(format!("✓ up to date · {} tracks in library", app.library.tracks.len()), Style::default().fg(LIME)));
         if spans.len() > 1 {
