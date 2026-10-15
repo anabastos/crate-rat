@@ -10,6 +10,7 @@ use crate::config;
 use crate::library::{self, Library, LibraryTrack, TagStatus};
 use crate::metadata::{self, TrackMetadata};
 use crate::player;
+use crate::rekordbox;
 use crate::model::{CrateLocation, ImportService, Location, Playlist, PlaylistLink};
 use crate::soundcloud;
 use crate::spotify;
@@ -99,6 +100,11 @@ pub struct App {
     /// slow — `MIN_REQUEST_INTERVAL` in tidal.rs paces requests ~5s apart) every single time.
     /// Press `R` on a specific playlist to force a fresh check regardless.
     tidal_refreshed_crates: std::collections::HashSet<String>,
+    /// Whether the REKORD crate was already added automatically once (see `add_rekordbox_crate`).
+    rekordbox_crate_added: bool,
+    /// The last rekordbox read: master.db's modification time and its playlists, in rekordbox's
+    /// order. Re-read only when rekordbox has written to its library since.
+    rekordbox_cache: Option<(Option<std::time::SystemTime>, Vec<rekordbox::RekordboxPlaylist>)>,
 }
 
 struct PendingImport {
@@ -396,6 +402,8 @@ impl App {
             tidal_playlist_download_rx: None,
             tidal_crate_refresh_rx: None,
             tidal_refreshed_crates: std::collections::HashSet::new(),
+            rekordbox_crate_added: false,
+            rekordbox_cache: None,
         }
     }
 
@@ -515,6 +523,7 @@ impl App {
             tidal_country_code: self.tidal_country_code.clone(),
             lastfm_api_key: self.lastfm_api_key.clone(),
             cloud_backup_dir: self.cloud_backup_dir.clone(),
+            rekordbox_crate_added: self.rekordbox_crate_added,
         })?;
         if self.library_dirty {
             library::save(&self.library)?;
@@ -636,6 +645,7 @@ impl App {
                 app.tidal_country_code = loaded.tidal_country_code;
                 app.lastfm_api_key = loaded.lastfm_api_key;
                 app.cloud_backup_dir = loaded.cloud_backup_dir;
+                app.rekordbox_crate_added = loaded.rekordbox_crate_added;
                 app.crates = loaded.crates;
             }
             Ok(None) => app.message = format!("No config yet. Press c, then n to add a crate. ({})", config::display_path()),
@@ -655,6 +665,7 @@ impl App {
             Err(error) => app.message = format!("Could not read the library ({error}) — rebuilding it from disk."),
         }
         app.library.prune_missing_files();
+        app.add_rekordbox_crate();
         app.tag_worker = Some(TagWorker::spawn(app.lastfm_api_key.clone()));
         app.refresh_availability();
         app.rescan_playlists();
@@ -682,9 +693,69 @@ impl App {
         self.refresh_derived();
     }
 
+    /// Adds the REKORD crate the first time rekordbox's library is found on this machine. Only
+    /// ever done once, so deleting the crate isn't undone on the next launch.
+    fn add_rekordbox_crate(&mut self) {
+        if self.rekordbox_crate_added || self.crates.iter().any(|crate_location| crate_location.rekordbox) {
+            return;
+        }
+        let Some(db_path) = rekordbox::default_db_path() else { return };
+        self.crates.push(CrateLocation {
+            name: rekordbox::CRATE_NAME.into(),
+            locations: vec![Location { path: db_path.to_string_lossy().to_string(), removable: false }],
+            available: true,
+            playlists: vec![],
+            rekordbox: true,
+        });
+        self.rekordbox_crate_added = true;
+    }
+
+    /// Playlists of a REKORD crate, read from rekordbox's master.db (re-read only if it changed).
+    /// On failure the crate keeps what it last showed and the error goes to the status line.
+    fn scan_rekordbox_crate(&mut self, crate_index: usize) -> Option<Vec<Playlist>> {
+        let db_path = PathBuf::from(&self.crates.get(crate_index)?.locations.first()?.path);
+        let modified = |path: &std::path::Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+        let stamp = modified(&db_path).max(modified(&PathBuf::from(format!("{}-wal", db_path.display()))));
+        if self.rekordbox_cache.as_ref().is_none_or(|(cached, _)| *cached != stamp) {
+            match rekordbox::load_playlists(&db_path) {
+                Ok(playlists) => self.rekordbox_cache = Some((stamp, playlists)),
+                Err(error) => {
+                    self.message = format!("Could not read rekordbox's library ({}): {error}", db_path.display());
+                    return None;
+                }
+            }
+        }
+        let (_, cache) = self.rekordbox_cache.as_ref()?;
+        Some(
+            cache
+                .iter()
+                .map(|playlist| Playlist {
+                    name: playlist.name.clone(),
+                    track_count: playlist.tracks.len(),
+                    // "Synced" here means the audio file is actually reachable right now.
+                    synced: playlist.tracks.iter().filter(|track| track.file.remote_metadata.is_none()).count(),
+                    tags: Vec::new(),
+                    link: None,
+                    track_ids: Vec::new(),
+                    auto_tags: Vec::new(),
+                })
+                .collect(),
+        )
+    }
+
     fn rescan_crate_quiet(&mut self, crate_index: usize) {
+        if self.crates.get(crate_index).is_some_and(|crate_location| crate_location.rekordbox) {
+            let Some(scanned) = self.scan_rekordbox_crate(crate_index) else { return };
+            self.apply_scanned_playlists(crate_index, scanned);
+            return;
+        }
         let Some(crate_location) = self.crates.get(crate_index) else { return };
         let scanned = sync::scan_crate_playlists(crate_location);
+        self.apply_scanned_playlists(crate_index, scanned);
+    }
+
+    fn apply_scanned_playlists(&mut self, crate_index: usize, scanned: Vec<Playlist>) {
+        let Some(crate_location) = self.crates.get(crate_index) else { return };
         let merged = merge_playlists(&crate_location.playlists, scanned);
         self.crates[crate_index].playlists = merged;
         for playlist_index in 0..self.crates[crate_index].playlists.len() {
@@ -711,6 +782,18 @@ impl App {
     /// playlist is dropped — it's the same track, already downloaded.
     fn playlist_tracks(&mut self, crate_index: usize, playlist_name: &str) -> (Vec<TrackFile>, Vec<String>) {
         let Some(crate_location) = self.crates.get(crate_index) else { return (Vec::new(), Vec::new()) };
+        if crate_location.rekordbox {
+            let listed = self.rekordbox_cache.as_ref().and_then(|(_, cache)| cache.iter().find(|playlist| playlist.name.eq_ignore_ascii_case(playlist_name)));
+            let Some(listed) = listed else { return (Vec::new(), Vec::new()) };
+            let (files, infos): (Vec<TrackFile>, Vec<library::TrackInfo>) = listed.tracks.iter().map(|track| (track.file.clone(), track.info.clone())).unzip();
+            let ids = files
+                .iter()
+                .zip(infos)
+                .map(|(file, info)| if file.remote_metadata.is_none() { self.library.resolve_known_file(file, info) } else { self.library.upsert(info) })
+                .collect();
+            self.library_dirty = true;
+            return (files, ids);
+        }
         let link = crate_location.playlists.iter().find(|playlist| playlist.name.eq_ignore_ascii_case(playlist_name)).and_then(|playlist| playlist.link.clone());
         let listed = sync::list_playlist_tracks(crate_location, playlist_name);
         let resolved: Vec<(TrackFile, String)> = listed
@@ -1081,7 +1164,7 @@ impl App {
                 self.message = "Manage crates. Press n for a new one, Enter to edit a field.".into();
             }
             KeyCode::Char('n') => {
-                self.crates.push(CrateLocation { name: "New crate".into(), locations: vec![Location { path: String::new(), removable: false }], available: true, playlists: vec![] });
+                self.crates.push(CrateLocation { name: "New crate".into(), locations: vec![Location { path: String::new(), removable: false }], available: true, playlists: vec![], rekordbox: false });
                 self.selected_crate = self.crates.len() - 1;
                 self.config_field = 0;
                 self.screen = Screen::Config;
@@ -1436,6 +1519,10 @@ impl App {
             ImportStep::Crate => {
                 if self.crates.is_empty() {
                     self.message = "No crates yet. Press c, then n to add one first.".into();
+                    return;
+                }
+                if self.crates.get(import.crate_index).is_some_and(|crate_location| crate_location.rekordbox) {
+                    self.message = "REKORD mirrors rekordbox and is read-only. Pick another crate.".into();
                     return;
                 }
                 if import.is_new == Some(true) {
@@ -1851,6 +1938,10 @@ impl App {
     /// playlist to be linked to a SoundCloud playlist first, via `i`).
     fn start_download(&mut self) {
         let Some(view) = &self.tracks else { return };
+        if self.crates.iter().any(|crate_location| crate_location.rekordbox && crate_location.name == view.crate_name) {
+            self.message = "REKORD playlists are read-only: they play the files rekordbox already knows about.".into();
+            return;
+        }
         let Some(service) = view.playlist.link.as_ref().map(|link| link.service) else {
             self.message = "This playlist isn't linked to a service yet. Use i to import/link one.".into();
             return;
@@ -2507,7 +2598,7 @@ impl App {
                 let _ = self.save_config();
             }
             KeyCode::Char('n') => {
-                self.crates.push(CrateLocation { name: "New crate".into(), locations: vec![Location { path: String::new(), removable: false }], available: true, playlists: vec![] });
+                self.crates.push(CrateLocation { name: "New crate".into(), locations: vec![Location { path: String::new(), removable: false }], available: true, playlists: vec![], rekordbox: false });
                 self.selected_crate = self.crates.len() - 1;
                 self.config_field = 0;
                 self.message = "New crate added. Name it, then Enter to save.".into();

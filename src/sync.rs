@@ -7,6 +7,7 @@ use std::{
 
 use crate::model::{CrateLocation, Playlist};
 
+#[derive(Clone)]
 pub struct TrackFile {
     pub name: String,
     pub path: PathBuf,
@@ -17,6 +18,7 @@ pub struct TrackFile {
 
 /// Metadata pulled from an imported service manifest (`*-tracks.json`) rather than read from
 /// a local audio file's tags — used for playlists imported without downloading actual audio.
+#[derive(Clone)]
 pub struct RemoteTrackMetadata {
     pub artist: String,
     pub album: String,

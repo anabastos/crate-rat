@@ -253,6 +253,21 @@ impl Library {
         id
     }
 
+    /// Library id for a local audio file whose metadata we already know (from rekordbox's
+    /// database), without reading the file's own tags.
+    pub fn resolve_known_file(&mut self, track: &TrackFile, info: TrackInfo) -> String {
+        let key = track.path.to_string_lossy().to_string();
+        let modified_secs = track.modified.and_then(|modified| modified.duration_since(UNIX_EPOCH).ok()).map_or(0, |elapsed| elapsed.as_secs());
+        if let Some(entry) = self.files.get(&key) {
+            if entry.size_bytes == track.size_bytes && entry.modified_secs == modified_secs && self.tracks.contains_key(&entry.track_id) {
+                return entry.track_id.clone();
+            }
+        }
+        let id = self.upsert(info);
+        self.files.insert(key, FileEntry { track_id: id.clone(), size_bytes: track.size_bytes, modified_secs });
+        id
+    }
+
     /// Library id for any entry of a playlist listing — a local file or an import-manifest entry.
     pub fn resolve(&mut self, track: &TrackFile, service: Option<&PlaylistLink>) -> String {
         match &track.remote_metadata {

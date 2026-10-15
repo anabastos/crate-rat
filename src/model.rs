@@ -7,6 +7,10 @@ pub struct CrateLocation {
     pub available: bool,
     #[serde(default)]
     pub playlists: Vec<Playlist>,
+    /// A crate that mirrors rekordbox's playlists instead of folders on disk: its one location
+    /// is the path of rekordbox's `master.db`, read-only (see `rekordbox.rs`).
+    #[serde(default)]
+    pub rekordbox: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,4 +69,4 @@ impl ImportService {
             ImportService::SoundCloud => "SoundCloud",
         }
     }
-}
+}
