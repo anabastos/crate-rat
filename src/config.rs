@@ -60,7 +60,14 @@ fn config_path() -> io::Result<PathBuf> {
 }
 
 /// The directory holding config.json and library.json.
+///
+/// `RATCRATE_CONFIG_DIR` overrides it, so both can live in a cloud-synced folder shared by
+/// several machines (a PC and a phone running Termux, say).
 pub fn config_dir() -> io::Result<PathBuf> {
+    if let Some(dir) = env::var_os("RATCRATE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+
     if let Some(app_data) = env::var_os("APPDATA") {
         return Ok(PathBuf::from(app_data).join("ratcrate"));
     }

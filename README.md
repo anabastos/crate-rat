@@ -58,6 +58,11 @@ local tracks (with cover art and metadata) right from the terminal.
 cargo run
 ```
 
+Config and library live in `%APPDATA%\ratcrate` (Windows) or `~/.config/ratcrate`. Set
+`RATCRATE_CONFIG_DIR` to keep them somewhere else, e.g. a cloud-synced folder shared with
+another machine. Don't run Crate Rat on two machines at once against the same folder: the last
+one to save wins.
+
 ### Dashboard
 
 - `j`/`k` or arrow keys — move between playlists
