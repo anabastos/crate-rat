@@ -90,16 +90,47 @@ fn track_count_for(dir: &Path) -> usize {
 }
 
 fn count_unique_files(dir: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|entry| entry.path().is_file())
-        .filter(|entry| !entry.file_name().to_string_lossy().ends_with("-tracks.json"))
-        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
-        .collect::<HashSet<_>>()
-        .len()
+    playlist_files(dir).iter().map(|file| file.strip_prefix(dir).unwrap_or(file).to_string_lossy().to_lowercase()).collect::<HashSet<_>>().len()
+}
+
+/// Audio formats picked up from a playlist's subfolders.
+const AUDIO_EXTENSIONS: [&str; 11] = ["mp3", "flac", "wav", "aif", "aiff", "ogg", "opus", "m4a", "aac", "alac", "wma"];
+
+/// How deep to look inside a playlist folder (`playlist/artist/album/disc/...`).
+const MAX_DEPTH: usize = 6;
+
+/// Every track file in a playlist folder: the files directly inside it (minus import
+/// manifests), plus audio files in any subfolder, so an album crate laid out as
+/// `artist/album/track.mp3` still counts and lists its tracks. Subfolders only contribute audio
+/// files, so cover art and rip logs kept next to an album don't show up as tracks.
+fn playlist_files(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < MAX_DEPTH {
+                    walk(&path, depth + 1, out);
+                }
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let keep = if depth == 0 {
+                !name.ends_with("-tracks.json")
+            } else {
+                path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| AUDIO_EXTENSIONS.contains(&extension.to_lowercase().as_str()))
+            };
+            if keep {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, 0, &mut files);
+    files
 }
 
 /// Lists the tracks inside `playlist_name`'s folder, taken from the first path in
@@ -118,18 +149,13 @@ pub fn list_playlist_tracks(crate_location: &CrateLocation, playlist_name: &str)
             if !path.is_dir() || entry.file_name().to_string_lossy().to_lowercase() != key {
                 continue;
             }
-            let Ok(files) = fs::read_dir(&path) else {
-                return Vec::new();
-            };
-            let mut tracks: Vec<TrackFile> = files
-                .flatten()
-                .filter(|file| file.path().is_file())
-                .filter(|file| !file.file_name().to_string_lossy().ends_with("-tracks.json"))
+            let mut tracks: Vec<TrackFile> = playlist_files(&path)
+                .into_iter()
                 .map(|file| {
-                    let metadata = file.metadata().ok();
+                    let metadata = fs::metadata(&file).ok();
                     TrackFile {
-                        name: file.file_name().to_string_lossy().to_string(),
-                        path: file.path(),
+                        name: file.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default(),
+                        path: file,
                         size_bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
                         modified: metadata.and_then(|metadata| metadata.modified().ok()),
                         remote_metadata: None,
@@ -152,7 +178,8 @@ pub fn list_playlist_tracks(crate_location: &CrateLocation, playlist_name: &str)
                 }
             }
 
-            tracks.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+            // Path order keeps an album's tracks together and in disc/track order.
+            tracks.sort_unstable_by(|a, b| a.path.cmp(&b.path));
             return tracks;
         }
     }
@@ -212,4 +239,29 @@ fn read_manifest(manifest: &Path) -> Option<Vec<TrackFile>> {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Location;
+
+    #[test]
+    fn playlists_include_audio_in_subfolders() {
+        let root = std::env::temp_dir().join(format!("crate-rat-sync-test-{}", std::process::id()));
+        let album = root.join("Albuns").join("Artist").join("Album");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(root.join("Albuns").join("loose.mp3"), b"").unwrap();
+        fs::write(album.join("01 - One.flac"), b"").unwrap();
+        fs::write(album.join("02 - Two.mp3"), b"").unwrap();
+        fs::write(album.join("cover.jpg"), b"").unwrap();
+        let crate_location = CrateLocation { name: "c".into(), locations: vec![Location { path: root.to_string_lossy().to_string(), removable: false }], available: true, playlists: vec![], rekordbox: false };
+        let playlists = scan_crate_playlists(&crate_location);
+        let tracks = list_playlist_tracks(&crate_location, "Albuns");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].track_count, 3);
+        let names: Vec<&str> = tracks.iter().map(|track| track.name.as_str()).collect();
+        assert_eq!(names, ["01 - One.flac", "02 - Two.mp3", "loose.mp3"]);
+    }
 }
