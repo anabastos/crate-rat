@@ -5,6 +5,7 @@ mod metadata;
 mod model;
 mod player;
 mod soundcloud;
+mod splash;
 mod spotify;
 mod tags;
 mod tidal;
@@ -15,7 +16,7 @@ use std::{error::Error, io};
 
 use app::App;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -85,7 +86,7 @@ fn restore_stderr(saved: Option<i32>) {
 }
 
 fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), Box<dyn Error>> {
-    let mut app = App::load();
+    let Some(mut app) = load_with_splash(terminal)? else { return Ok(()) };
     while !app.should_quit {
         app.poll_spotify_login();
         app.poll_spotify_import();
@@ -107,4 +108,27 @@ fn run<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), B
     }
     app.shutdown();
     Ok(())
-}
+}
+
+/// Shows the splash screen until the app has loaded. `None` if the user quit (q / Esc) first.
+fn load_with_splash<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<Option<App>, Box<dyn Error>> {
+    let loading = App::load_in_background();
+    let mut tick = 0usize;
+    loop {
+        match loading.try_recv() {
+            Ok(loaded) => return Ok(Some(loaded.into_app())),
+            // The loader panicked; load on this thread so the real error surfaces normally.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(Some(App::load())),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        terminal.draw(|frame| splash::draw(frame, tick))?;
+        tick = tick.wrapping_add(1);
+        if event::poll(std::time::Duration::from_millis(80))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
