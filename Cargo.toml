@@ -23,6 +23,11 @@ rodio = "0.19"
 # Decodes playback audio ourselves (see src/player.rs): every common DJ format, including
 # AAC/ALAC in .m4a — what tidal-dl-ng usually saves — which rodio's defaults can't play.
 symphonia = { version = "0.5", features = ["all"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+miniz_oxide = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # Only to point stderr at a log file while the TUI is up (see main.rs).
@@ -32,3 +37,7 @@ libc = "0.2"
 lto = true
 codegen-units = 1
 strip = true
+
+# Decrypting rekordbox's master.db (PBKDF2 + AES over ~100MB) crawls without optimizations.
+[profile.dev.package."*"]
+opt-level = 3

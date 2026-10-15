@@ -14,6 +14,8 @@ const PINK: Color = Color::Rgb(255, 0, 170);
 const LIME: Color = Color::Rgb(130, 255, 0);
 const YELLOW: Color = Color::Rgb(255, 235, 0);
 const BLUE: Color = Color::Rgb(90, 120, 255);
+/// The REKORD crate (rekordbox's playlists) stands apart from folder crates in this colour.
+const REKORD: Color = Color::Rgb(255, 120, 0);
 const PANEL: Color = Color::Rgb(3, 3, 8);
 const BACKDROP: Color = Color::Black;
 
@@ -447,9 +449,9 @@ fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
         let selected = index == app.selected_crate;
         let marker = if item.available { "♥" } else { "♡" };
         let marker_color = if item.available { LIME } else { PINK };
-        let name_color = if selected { INK } else { CYAN };
+        let name_color = if item.rekordbox { REKORD } else if selected { INK } else { CYAN };
         let mut spans = vec![
-            Span::styled(format!("{} ", marker), Style::default().fg(marker_color)),
+            Span::styled(format!("{} ", marker), Style::default().fg(if item.rekordbox { REKORD } else { marker_color })),
             Span::styled(&item.name, Style::default().fg(name_color)),
         ];
         if !item.available {
@@ -762,7 +764,7 @@ fn draw_crates(frame: &mut Frame, app: &App, area: Rect) {
     let inner_width = area.width.saturating_sub(4).max(8) as usize;
     let items = app.crates.iter().map(|item| {
         let marker = if item.available { "♥" } else { "♡" };
-        let color = if item.available { LIME } else { BLUE };
+        let color = if item.rekordbox { REKORD } else if item.available { LIME } else { BLUE };
         let mut lines = vec![Line::from(Span::styled(format!("{} {}", marker, item.name), Style::default().fg(color)))];
         for location in &item.locations {
             let found = std::path::Path::new(&location.path).exists();
@@ -809,10 +811,17 @@ fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .style(Style::default().fg(status_color))
     });
-    let title: &'static str = if crate_location.locations.len() > 1 { "♫ PLAYLISTS (shared across paths) ♫" } else { "♫ PLAYLISTS ♫" };
+    let title: &'static str = if crate_location.rekordbox {
+        "♫ REKORDBOX PLAYLISTS ♫"
+    } else if crate_location.locations.len() > 1 {
+        "♫ PLAYLISTS (shared across paths) ♫"
+    } else {
+        "♫ PLAYLISTS ♫"
+    };
+    let block = if crate_location.rekordbox { rekord_panel(title) } else { panel(title) };
     let table = Table::new(rows, [Constraint::Percentage(26), Constraint::Length(9), Constraint::Length(11), Constraint::Length(16), Constraint::Min(10)])
         .header(Row::new(vec!["PLAYLIST", "TRACKS", "STATUS", "SYNC", "TAGS"]).style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)))
-        .block(panel(title))
+        .block(block)
         .row_highlight_style(Style::default().bg(Color::Rgb(40, 0, 35)).fg(INK).add_modifier(Modifier::BOLD));
     let mut state = TableState::default();
     state.select(Some(app.selected_playlist));
@@ -839,7 +848,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![Span::styled("  ✦ ", Style::default().fg(LIME)), Span::styled(app.message.clone(), Style::default().fg(INK))];
     if let Some(crate_location) = app.crates.get(app.selected_crate) {
         spans.push(Span::styled("   ", Style::default()));
-        spans.push(pill(&crate_location.name, PANEL, PINK));
+        spans.push(pill(&crate_location.name, PANEL, if crate_location.rekordbox { REKORD } else { PINK }));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -850,6 +859,17 @@ fn panel(title: &'static str) -> Block<'static> {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(CYAN))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(PANEL))
+}
+
+/// `panel` in the REKORD crate's colour.
+fn rekord_panel(title: &'static str) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(format!(" {} ", title), Style::default().fg(PANEL).bg(REKORD).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(REKORD))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(PANEL))
 }

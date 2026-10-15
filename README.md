@@ -43,6 +43,12 @@ local tracks (with cover art and metadata) right from the terminal.
   Drive…) and a full snapshot of the library + every playlist's tracklist is written there
   (`crate-rat-backup.json`, no credentials). A new machine with an empty library restores from it
   automatically; `s` → `B` merges it in manually.
+- **rekordbox playlists (REKORD crate)**: if rekordbox 6/7 is installed, a REKORD crate (shown in
+  orange) lists every rekordbox playlist, folders included (`dnb/hardcore/…`), read straight from
+  rekordbox's `master.db`. Nothing is copied or written: tracks play from the files rekordbox
+  already points to, and rekordbox's own artist/album/genre fill the library. Tracks on a drive
+  that isn't plugged in, and Tidal streaming entries, show as ☁. `r` picks up changes made in
+  rekordbox. Its path (the `master.db`) can be changed from `c`; deleting the crate keeps it gone.
 - Playlists that only have imported metadata (no downloaded audio) are shown with a ☁ marker and
   can't be played — only ones with real local files can.
 

@@ -25,6 +25,9 @@ pub struct AppConfig {
     /// snapshot of the library and every playlist's tracklist is written on each save.
     #[serde(default)]
     pub cloud_backup_dir: Option<String>,
+    /// Set once the REKORD crate has been added automatically, so deleting it sticks.
+    #[serde(default)]
+    pub rekordbox_crate_added: bool,
 }
 
 pub fn load() -> io::Result<Option<AppConfig>> {
@@ -91,9 +94,10 @@ mod tests {
             name: "Test crate".into(),
             locations: vec![Location { path: "/music/test".into(), removable: false }],
             available: true,
+            rekordbox: false,
             playlists: vec![Playlist { name: "Test playlist".into(), track_count: 10, synced: 5, tags: vec!["test".into()], link: None, track_ids: vec![], auto_tags: vec![] }],
         }];
-        let config = AppConfig { crates: crates.clone(), spotify_client_id: None, spotify_refresh_token: None, tidal_client_id: None, tidal_client_secret: None, tidal_country_code: None, lastfm_api_key: None, cloud_backup_dir: None };
+        let config = AppConfig { crates: crates.clone(), spotify_client_id: None, spotify_refresh_token: None, tidal_client_id: None, tidal_client_secret: None, tidal_country_code: None, lastfm_api_key: None, cloud_backup_dir: None, rekordbox_crate_added: false };
         let json = serde_json::to_string(&config).expect("app config should serialize");
         let restored: AppConfig = serde_json::from_str(&json).expect("app config should deserialize");
         assert_eq!(restored.crates[0].name, crates[0].name);

@@ -4,6 +4,7 @@ mod library;
 mod metadata;
 mod model;
 mod player;
+mod rekordbox;
 mod soundcloud;
 mod spotify;
 mod tags;
