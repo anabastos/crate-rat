@@ -331,6 +331,19 @@ impl ImportState {
     }
 }
 
+/// An [`App`] fresh out of [`App::load`], handed from the loader thread to the UI thread.
+pub struct LoadedApp(App);
+
+// SAFETY: `App` isn't `Send` only because of the rodio output stream, which `load` never
+// opens (audio starts on the first play; asserted in `load_in_background`).
+unsafe impl Send for LoadedApp {}
+
+impl LoadedApp {
+    pub fn into_app(self) -> App {
+        self.0
+    }
+}
+
 impl App {
     pub fn demo() -> Self {
         Self {
@@ -659,6 +672,18 @@ impl App {
         let _ = app.save_config();
         app.start_tidal_crate_refresh(app.selected_crate);
         app
+    }
+
+    /// Runs [`App::load`] on its own thread so the UI can show the splash screen meanwhile —
+    /// loading rescans every crate on disk and can take a while on big or slow drives.
+    pub fn load_in_background() -> std::sync::mpsc::Receiver<LoadedApp> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let app = App::load();
+            assert!(app.audio_stream.is_none(), "App::load must not open audio output");
+            let _ = tx.send(LoadedApp(app));
+        });
+        rx
     }
 
     /// Rescans one crate from disk, resolves every playlist's tracks into library ids, and
