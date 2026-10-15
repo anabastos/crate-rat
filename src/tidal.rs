@@ -455,6 +455,11 @@ fn run_tidal_dl_ng(args: &[&str], timeout: Duration, mut on_line: impl FnMut(&st
         // first-run login, etc), it gets EOF immediately instead of blocking forever — this app
         // has no way to answer an interactive prompt since it owns the terminal in raw mode.
         .stdin(Stdio::null())
+        // With its output piped, Python on Windows writes in the console's legacy code page
+        // (cp1252 and friends), which can't encode Cyrillic, Japanese, etc: printing such a
+        // track name crashes tidal-dl-ng with a UnicodeEncodeError. Force UTF-8 instead.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -466,8 +471,8 @@ fn run_tidal_dl_ng(args: &[&str], timeout: Duration, mut on_line: impl FnMut(&st
     // exit status, so lines show up live instead of only after the process ends.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let stdout_tx = tx.clone();
-    let stdout_handle = child.stdout.take().map(|stdout| std::thread::spawn(move || for line in BufReader::new(stdout).lines().map_while(Result::ok) { let _ = stdout_tx.send(line); }));
-    let stderr_handle = child.stderr.take().map(|stderr| std::thread::spawn(move || for line in BufReader::new(stderr).lines().map_while(Result::ok) { let _ = tx.send(line); }));
+    let stdout_handle = child.stdout.take().map(|stdout| std::thread::spawn(move || forward_lines(stdout, &stdout_tx)));
+    let stderr_handle = child.stderr.take().map(|stderr| std::thread::spawn(move || forward_lines(stderr, &tx)));
 
     let mut noise = NoiseFilter::new();
     let deadline = Instant::now() + timeout;
@@ -502,6 +507,24 @@ fn run_tidal_dl_ng(args: &[&str], timeout: Duration, mut on_line: impl FnMut(&st
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(format!("tidal-dl-ng exited with {status}")),
         None => Err(format!("tidal-dl-ng timed out after {} minutes (likely stuck waiting on a prompt)", timeout.as_secs() / 60)),
+    }
+}
+
+/// Sends every line of `pipe` to `tx`. Lines that aren't valid UTF-8 (a track name printed in a
+/// legacy code page) are decoded lossily instead of ending the read: `BufRead::lines` stops at
+/// the first such line, after which nobody drains the pipe and the child blocks until timeout.
+fn forward_lines(pipe: impl std::io::Read, tx: &std::sync::mpsc::Sender<String>) {
+    let mut reader = BufReader::new(pipe);
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buffer);
+                let _ = tx.send(line.trim_end_matches(['\n', '\r']).to_string());
+            }
+        }
     }
 }
 
@@ -570,5 +593,28 @@ fn describe_error(error: ureq::Error) -> String {
             format!("HTTP {code}: {body}")
         }
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_lines_survives_non_utf8_output() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // "Кино - Группа крови" in cp1251, then a UTF-8 line: the second must still come through.
+        let output: &[u8] = b"Downloading \xca\xe8\xed\xee - \xc3\xf0\xf3\xef\xef\xe0 \xea\xf0\xee\xe2\xe8\r\nDone \xd0\x9a\xd0\xb8\xd0\xbd\xd0\xbe\n";
+        forward_lines(output, &tx);
+        drop(tx);
+        let lines: Vec<String> = rx.iter().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("Downloading "));
+        assert_eq!(lines[1], "Done Кино");
+    }
+
+    #[test]
+    fn percent_encodes_cyrillic_as_utf8() {
+        assert_eq!(percent_encode("Кино"), "%D0%9A%D0%B8%D0%BD%D0%BE");
     }
 }

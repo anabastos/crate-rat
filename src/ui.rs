@@ -79,6 +79,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(log) = &app.tidal_log {
         draw_download_log(frame, log, area);
     }
+    if app.confirm_quit {
+        draw_confirm_quit(frame, area);
+    }
 }
 
 fn draw_download_log(frame: &mut Frame, log: &crate::app::DownloadLog, area: Rect) {
@@ -400,6 +403,43 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)])
         .split(vertical[1])[1]
+}
+
+fn draw_confirm_quit(frame: &mut Frame, area: Rect) {
+    // A sad little rat, watching you go.
+    const SAD_RAT: [&str; 4] = [
+        r#"  ()_()    "#,
+        r#"  ( ;.;)   "#,
+        r#" c(")(")~~~"#,
+        r#"  *sniff*  "#,
+    ];
+    let mut lines: Vec<Line> = SAD_RAT.iter().map(|row| Line::from(Span::styled(*row, Style::default().fg(BLUE)))).collect();
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled("are you sure you want to close rat crate?", Style::default().fg(INK).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled(" ▶ NO! ", Style::default().fg(PANEL).bg(LIME).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            pill("Enter", PANEL, INK),
+            Span::styled(" NO!   ", Style::default().fg(CYAN)),
+            pill("Esc", BACKDROP, PINK),
+            Span::styled(" close", Style::default().fg(CYAN)),
+        ]),
+    ]);
+    // Sized to its content (borders + padding add 4 rows/cols), centered.
+    let width = 52.min(area.width);
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let popup = Rect::new(area.x + (area.width - width) / 2, area.y + (area.height - height) / 2, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" 🐀 LEAVING? 🐀 ", Style::default().fg(PANEL).bg(PINK).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(PINK))
+        .padding(Padding::uniform(1))
+        .style(Style::default().bg(PANEL));
+    frame.render_widget(Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center).block(block), popup);
 }
 
 fn draw_confirm_delete(frame: &mut Frame, app: &App, index: usize, area: Rect) {

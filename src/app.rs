@@ -45,6 +45,8 @@ pub struct App {
     pub crates: Vec<CrateLocation>,
     pub message: String,
     pub pending_delete: Option<usize>,
+    /// Esc on the dashboard asked to close Crate Rat: Esc again quits, Enter ("NO!") stays.
+    pub confirm_quit: bool,
     pub tag_browser: Option<TagBrowser>,
     pub tidal_log: Option<DownloadLog>,
     pub import: Option<ImportState>,
@@ -361,6 +363,7 @@ impl App {
             crates: vec![],
             message: "No crates yet. Press c, then n to add one.".into(),
             pending_delete: None,
+            confirm_quit: false,
             tag_browser: None,
             tidal_log: None,
             import: None,
@@ -1024,6 +1027,14 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.confirm_quit {
+            match key {
+                KeyCode::Esc => self.should_quit = true,
+                KeyCode::Enter => self.confirm_quit = false,
+                _ => {}
+            }
+            return;
+        }
         if self.import_fetch_rx.is_some() {
             match key {
                 KeyCode::Char('q') => self.should_quit = true,
@@ -1126,7 +1137,8 @@ impl App {
 
     fn handle_dashboard_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => self.confirm_quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 let count = self.current_playlists().len();
                 if count > 0 {
