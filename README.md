@@ -18,7 +18,7 @@ local tracks (with cover art and metadata) right from the terminal.
   downloadable stream, so this is metadata-only — see below for turning it into real audio).
   Requires your own Spotify Developer app (Client ID, set from Settings).
 - **SoundCloud import**: paste a link to a *public* playlist — no login or app registration
-  needed. Downloads the actual audio (progressive streams only; Go+-exclusive tracks are skipped).
+  needed. Downloads the actual audio (direct or unencrypted HLS streams; Go+-exclusive tracks are skipped).
 - **Tidal catalog search**: check which tracks in a playlist exist on Tidal (app-only, no user
   login — just a Client ID/Secret from Settings).
 - **Tidal import + download**: paste a Tidal playlist link to link it (looks up just the name via
