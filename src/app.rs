@@ -2128,7 +2128,7 @@ impl App {
             Ok(Ok(result)) => {
                 self.soundcloud_download_rx = None;
                 let downloaded = result.tracks.len();
-                self.message = if result.failed == 0 { format!("Downloaded {downloaded} track(s) from SoundCloud.") } else { format!("Downloaded {downloaded} track(s), {} failed (likely Go+ exclusive).", result.failed) };
+                self.message = if result.failed == 0 { format!("Downloaded {downloaded} track(s) from SoundCloud.") } else { format!("Downloaded {downloaded} track(s), {} failed (e.g. {}).", result.failed, result.first_error.as_deref().unwrap_or("unknown error")) };
 
                 // Rescan so the crate's playlist reflects the newly downloaded files, and
                 // refresh the open track view so the ☁ metadata-only markers go away.
